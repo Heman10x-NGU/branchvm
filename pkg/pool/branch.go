@@ -440,7 +440,7 @@ func (b *Branch) restore(ctx context.Context) error {
 		return err
 	}
 	b.RestoreMs = time.Since(ready).Milliseconds()
-	if err := b.waitPostgres(ctx, 60*time.Second); err != nil {
+	if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
 		return err
 	}
 	b.FirstQueryMs = time.Since(load).Milliseconds()
@@ -458,7 +458,7 @@ func (b *Branch) bootColdReady(ctx context.Context, start time.Time) error {
 		return fmt.Errorf("cold boot: %w", err)
 	}
 	b.RestoreMs = time.Since(start).Milliseconds()
-	if err := b.waitPostgres(ctx, 60*time.Second); err != nil {
+	if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
 		return err
 	}
 	b.FirstQueryMs = time.Since(start).Milliseconds()
@@ -515,6 +515,15 @@ func (b *Branch) awaitPager() error {
 // waitPostgres proves the restored Postgres accepts connections. The
 // snapshot's /health pg_ready flag is memory state from before the pause,
 // so only a live pg_isready inside the guest counts.
+// pgReadyTimeout scales the Postgres barrier with the restore cap, so a
+// bench that allows a long cold-restore stampede does not trip a fixed limit.
+func pgReadyTimeout() time.Duration {
+	if RestoreTimeout > 60*time.Second {
+		return RestoreTimeout
+	}
+	return 60 * time.Second
+}
+
 func (b *Branch) waitPostgres(ctx context.Context, timeout time.Duration) error {
 	start := time.Now()
 	for {
