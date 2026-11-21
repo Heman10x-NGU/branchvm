@@ -386,6 +386,12 @@ func measureDensity(rec *types.BenchRecord, brs []*pool.Branch) {
 }
 
 func (b *bench) densityTable(ctx context.Context) error {
+	// N concurrent cold restores stampede one disk; the cap must not
+	// masquerade as a result, so give the stampede room and report the
+	// measured times.
+	old := pool.RestoreTimeout
+	pool.RestoreTimeout = 3 * time.Minute
+	defer func() { pool.RestoreTimeout = old }()
 	var sizes []int
 	for _, n := range densitySizes {
 		if n <= b.cfg.maxClones {

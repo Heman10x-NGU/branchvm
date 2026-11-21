@@ -33,12 +33,16 @@ const (
 	logName        = "firecracker.log"
 	guestMAC       = "AA:FC:00:00:00:01"
 	tapMAC         = "06:00:ac:10:00:01"
-	socketTimeout  = 5 * time.Second
-	restoreTimeout = 30 * time.Second
-	killTimeout    = 5 * time.Second
+	socketTimeout = 5 * time.Second
+	killTimeout   = 5 * time.Second
 	maxGuestBody   = 256 << 20
-	databaseURL    = "postgres://postgres@127.0.0.1:5432/" + databaseName + "?sslmode=disable"
+	databaseURL   = "postgres://postgres@127.0.0.1:5432/" + databaseName + "?sslmode=disable"
 )
+
+// RestoreTimeout caps how long a restored guest may take to serve /health.
+// Many concurrent cold restores stampede one disk, so the bench raises it;
+// the measured first-query time, not this cap, is the reported number.
+var RestoreTimeout = 30 * time.Second
 
 // vm is one Firecracker process running inside a branch netns.
 type vm struct {
@@ -432,7 +436,7 @@ func (b *Branch) restore(ctx context.Context) error {
 		return err
 	}
 	b.Guest = newGuest(b.Net.GuestAPIAddr)
-	if err := b.Guest.waitReady(ctx, restoreTimeout, 2*time.Millisecond, nil); err != nil {
+	if err := b.Guest.waitReady(ctx, RestoreTimeout, 2*time.Millisecond, nil); err != nil {
 		return err
 	}
 	b.RestoreMs = time.Since(ready).Milliseconds()
