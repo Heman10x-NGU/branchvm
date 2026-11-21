@@ -4,6 +4,8 @@
 # BRANCH_INDEX=2: applies fixes/branch2.patch (ON CONFLICT DO NOTHING).
 # BRANCH_INDEX=3: applies fixes/branch3.patch (map unique violation 23505).
 set -euo pipefail
+# The sandbox blocks the network, so the local Go toolchain must do.
+export GOTOOLCHAIN=local
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 idx="${BRANCH_INDEX:-}"
