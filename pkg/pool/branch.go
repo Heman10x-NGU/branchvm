@@ -392,7 +392,30 @@ func (b *Branch) restore(ctx context.Context) error {
 		return err
 	}
 	b.RestoreMs = time.Since(ready).Milliseconds()
-	return nil
+	return b.waitPostgres(ctx, 60*time.Second)
+}
+
+// waitPostgres proves the restored Postgres accepts connections. The
+// snapshot's /health pg_ready flag is memory state from before the pause,
+// so only a live pg_isready inside the guest counts.
+func (b *Branch) waitPostgres(ctx context.Context, timeout time.Duration) error {
+	start := time.Now()
+	for {
+		res, err := b.Guest.exec(ctx, types.ExecRequest{
+			Cmd: []string{"pg_isready", "-h", "127.0.0.1", "-t", "2"}, TimeoutSec: 5,
+		})
+		if err == nil && res.ExitCode == 0 {
+			return nil
+		}
+		if time.Since(start) > timeout {
+			return fmt.Errorf("branch %d: postgres not accepting connections after %s", b.Index, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("branch %d: wait for postgres: %w", b.Index, ctx.Err())
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func (b *Branch) startGateway() error {
