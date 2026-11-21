@@ -22,10 +22,13 @@ import (
 	"github.com/Heman10x-NGU/branchvm/pkg/fcclient"
 	"github.com/Heman10x-NGU/branchvm/pkg/gateway"
 	"github.com/Heman10x-NGU/branchvm/pkg/netiso"
+	"github.com/Heman10x-NGU/branchvm/pkg/storage"
 	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 const (
+	uffdSockName   = "uffd.sock"
+	coldVCPUs      = 2
 	sockName       = "firecracker.sock"
 	logName        = "firecracker.log"
 	guestMAC       = "AA:FC:00:00:00:01"
@@ -279,6 +282,27 @@ type Branch struct {
 	RestoreMs int64
 	gwCancel  context.CancelFunc
 	gwDone    chan error
+
+	// Bench seam. Mode empty means FileRestore. FirstQueryMs runs from
+	// pager setup and LoadSnapshot (or cold boot start) to the first
+	// successful pg_isready round trip.
+	Mode          types.RestoreMode
+	FirstQueryMs  int64
+	PrefaultBytes int64
+	memMB         int64
+	pager         *storage.UffdServer
+	pagerErr      chan error
+}
+
+// Sync uploads a workspace tarball to the branch's /workspace.
+func (b *Branch) Sync(ctx context.Context, tgz []byte) error { return b.Guest.sync(ctx, tgz) }
+
+// PagerStats reports faults served and bytes copied by the uffd pager.
+func (b *Branch) PagerStats() (faults, bytes int64) {
+	if b.pager == nil {
+		return 0, 0
+	}
+	return b.pager.Stats()
 }
 
 // DummyKey is the per-branch key the guest presents to its gateway.
@@ -337,7 +361,16 @@ func (b *Branch) MemMB() int64 {
 // launchBranch builds branch i of runID and restores the golden snapshot
 // into it. On failure every partial resource is removed.
 func launchBranch(ctx context.Context, runID string, i int, memMB int64, record func(types.BranchState)) (*Branch, error) {
-	b := &Branch{RunID: runID, Index: i, Dir: cloneDir(runID, i)}
+	return LaunchBranch(ctx, runID, i, memMB, types.FileRestore, record)
+}
+
+// LaunchBranch is launchBranch with an explicit restore mode: cold boot,
+// File, PrefaultRestore, or Uffd. The bench drives every mode through it.
+func LaunchBranch(ctx context.Context, runID string, i int, memMB int64, mode types.RestoreMode, record func(types.BranchState)) (*Branch, error) {
+	if i < 1 || i > maxBranches {
+		return nil, fmt.Errorf("branch index %d outside 1..%d", i, maxBranches)
+	}
+	b := &Branch{RunID: runID, Index: i, Dir: cloneDir(runID, i), Mode: mode}
 	record(b.State(StatusStarting))
 	if err := b.launch(ctx, memMB, record); err != nil {
 		if terr := b.Teardown(); terr != nil {
@@ -362,6 +395,7 @@ func (b *Branch) launch(ctx context.Context, memMB int64, record func(types.Bran
 		return fmt.Errorf("cgroup: %w", err)
 	}
 	b.Cage = cage
+	b.memMB = memMB
 	if err := cloneReflink(goldenRootfs(), filepath.Join(b.Dir, RootfsName)); err != nil {
 		return err
 	}
@@ -383,16 +417,95 @@ func (b *Branch) restore(ctx context.Context) error {
 	if err := b.Cage.AddPID(b.VM.pid()); err != nil {
 		return fmt.Errorf("cgroup add pid: %w", err)
 	}
-	mem := fcclient.MemBackend{BackendType: fcclient.BackendFile, BackendPath: memFile()}
+	if b.Mode == types.ColdRestore {
+		return b.bootColdReady(ctx, ready)
+	}
+	load := time.Now()
+	mem, err := b.memBackend(ctx)
+	if err != nil {
+		return err
+	}
 	if err := b.VM.fc.LoadSnapshot(snapshotFile(), mem, true); err != nil {
 		return fmt.Errorf("load snapshot: %w", err)
+	}
+	if err := b.awaitPager(); err != nil {
+		return err
 	}
 	b.Guest = newGuest(b.Net.GuestAPIAddr)
 	if err := b.Guest.waitReady(ctx, restoreTimeout, 2*time.Millisecond, nil); err != nil {
 		return err
 	}
 	b.RestoreMs = time.Since(ready).Milliseconds()
-	return b.waitPostgres(ctx, 60*time.Second)
+	if err := b.waitPostgres(ctx, 60*time.Second); err != nil {
+		return err
+	}
+	b.FirstQueryMs = time.Since(load).Milliseconds()
+	return nil
+}
+
+// bootColdReady boots the clone's kernel from scratch, the path init
+// takes for the golden VM, and waits for a live Postgres.
+func (b *Branch) bootColdReady(ctx context.Context, start time.Time) error {
+	if err := b.VM.bootCold(b.memMB, coldVCPUs, b.Net.TapName); err != nil {
+		return err
+	}
+	b.Guest = newGuest(b.Net.GuestAPIAddr)
+	if err := b.Guest.waitReady(ctx, goldenBootTimeout, 20*time.Millisecond, nil); err != nil {
+		return fmt.Errorf("cold boot: %w", err)
+	}
+	b.RestoreMs = time.Since(start).Milliseconds()
+	if err := b.waitPostgres(ctx, 60*time.Second); err != nil {
+		return err
+	}
+	b.FirstQueryMs = time.Since(start).Milliseconds()
+	return nil
+}
+
+// memBackend prepares guest memory for b.Mode. The uffd pager lives in a
+// goroutine of this process for the VM's lifetime and stops in Teardown;
+// BranchState.PagerPID stays 0 because there is no separate process.
+func (b *Branch) memBackend(ctx context.Context) (fcclient.MemBackend, error) {
+	file := fcclient.MemBackend{BackendType: fcclient.BackendFile, BackendPath: memFile()}
+	switch b.Mode {
+	case "", types.FileRestore:
+		return file, nil
+	case PrefaultRestore:
+		if _, err := os.Stat(wsFile()); err != nil {
+			return file, nil
+		}
+		n, err := storage.Prefault(memFile(), wsFile())
+		if err != nil {
+			return file, fmt.Errorf("prefault: %w", err)
+		}
+		b.PrefaultBytes = n
+		return file, nil
+	case types.UffdRestore:
+		srv, err := storage.NewUffdServer(memFile(), filepath.Join(b.Dir, uffdSockName))
+		if err != nil {
+			return file, err
+		}
+		b.pager, b.pagerErr = srv, make(chan error, 1)
+		go func() { b.pagerErr <- srv.Serve(ctx) }()
+		return fcclient.MemBackend{BackendType: fcclient.BackendUffd, BackendPath: filepath.Join(b.Dir, uffdSockName)}, nil
+	}
+	return file, fmt.Errorf("unknown restore mode %q", b.Mode)
+}
+
+// awaitPager surfaces a failed uffd handshake instead of a guest that
+// hangs on its first page fault until restoreTimeout.
+func (b *Branch) awaitPager() error {
+	if b.pager == nil {
+		return nil
+	}
+	select {
+	case err := <-b.pagerErr:
+		if err != nil {
+			return fmt.Errorf("uffd pager handshake: %w", err)
+		}
+		return nil
+	case <-time.After(socketTimeout):
+		return fmt.Errorf("uffd pager: no handshake from firecracker after %s", socketTimeout)
+	}
 }
 
 // waitPostgres proves the restored Postgres accepts connections. The
@@ -460,7 +573,12 @@ func (b *Branch) Teardown() error {
 	if b.VM != nil {
 		b.VM.kill()
 	}
-	return teardownState(b.State(""))
+	var perr error
+	if b.pager != nil {
+		perr = b.pager.Close()
+		b.pager = nil
+	}
+	return errors.Join(perr, teardownState(b.State("")))
 }
 
 // teardownState removes one branch's resources from its saved state. It is

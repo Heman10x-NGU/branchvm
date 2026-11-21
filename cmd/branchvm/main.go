@@ -24,6 +24,8 @@ commands:
            reap resources of crashed runs; --run discards one run, live VMs included
   verify   [--repo examples/auth-demo]
            fire the 6 live isolation attacks and print PASS/FAIL
+  bench    [--repo examples/auth-demo] [--iters 10] [--out results/] [--fast] [--max-clones 20]
+           measure boot, pager, and RAM density; writes raw.jsonl and BENCHMARKS.md
 `
 
 // command is registered by the Linux-only cmd_*.go files. On other systems

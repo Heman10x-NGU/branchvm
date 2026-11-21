@@ -79,6 +79,29 @@ func bootArgs() string {
 func goldenRootfs() string { return filepath.Join(GoldenDir, RootfsName) }
 func snapshotFile() string { return filepath.Join(GoldenDir, "snapshot") }
 func memFile() string      { return filepath.Join(GoldenDir, "mem") }
+func wsFile() string       { return filepath.Join(GoldenDir, "ws.bin") }
+
+// PrefaultRestore is a File restore preceded by posix_fadvise(WILLNEED)
+// over the pages recorded in golden/ws.bin.
+const PrefaultRestore types.RestoreMode = "prefault-file"
+
+// GoldenMemPath and WorkingSetPath expose the golden mem file and its
+// recorded working set to the bench.
+func GoldenMemPath() string  { return memFile() }
+func WorkingSetPath() string { return wsFile() }
+
+// BenchPreflight runs the checks Init and Run make before touching VMs:
+// assets present, pool mounted, crashed runs reaped, no live run, and a
+// complete golden snapshot.
+func BenchPreflight(out io.Writer) error {
+	if err := checkPrereqs(); err != nil {
+		return err
+	}
+	if err := prepareHost(out); err != nil {
+		return err
+	}
+	return requireGolden()
+}
 func cloneDir(runID string, i int) string {
 	return filepath.Join(ClonesDir, fmt.Sprintf("%s-%d", runID, i))
 }
@@ -275,7 +298,25 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 	if err := v.fc.PauseVM(); err != nil {
 		return fmt.Errorf("pause golden VM: %w", err)
 	}
-	return writeSnapshot(v)
+	if err := writeSnapshot(v); err != nil {
+		return err
+	}
+	recordWorkingSet(opt.Out)
+	return nil
+}
+
+// recordWorkingSet saves golden/ws.bin from the page cache residency of
+// the mem file Firecracker just wrote. Freshly written pages are all
+// cached, so this approximates the whole file until `branchvm bench`
+// re-records it from a cold restore. It is optional, so failure warns.
+func recordWorkingSet(out io.Writer) {
+	ws, err := storage.RecordWorkingSet(memFile(), wsFile())
+	if err != nil {
+		_ = os.Remove(wsFile())
+		fmt.Fprintf(out, "warning: working set not recorded: %v\n", err)
+		return
+	}
+	fmt.Fprintf(out, "working set: %d of %d pages resident (%d MiB) in %s\n", ws.Resident, ws.Pages, ws.ResidentBytes()>>20, wsFile())
 }
 
 // warmGolden runs an optional command in the golden /workspace before the
