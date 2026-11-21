@@ -1,0 +1,8 @@
+bin/
+*.ext4
+*.img
+vm.mem
+vm.state
+ws.bin
+.DS_Store
+/tmp/
