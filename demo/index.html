@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>branchvm</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Host+Grotesk:wght@400..700&family=JetBrains+Mono:wght@400..500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0f0f0f; --surface: #1a1a1a; --line: #262626; --ink: #ffffff; --muted: #8f8f8f; --faint: #5a5a5a;
+  --accent: #dafa9c; --accent-ink: #0f0f0f; --fail: #ff8a7a;
+  --sans: "Host Grotesk", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 32px; }
+nav { display: flex; justify-content: space-between; align-items: center; padding: 22px 0; border-bottom: 1px solid var(--line); }
+.mark { font-family: var(--mono); font-size: 15px; font-weight: 500; }
+.mark b { color: var(--accent); font-weight: 500; }
+.host { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.dot { width: 7px; height: 7px; background: var(--faint); border-radius: 50%; }
+.dot.on { background: var(--accent); box-shadow: 0 0 0 4px rgba(218,250,156,.12); }
+.hero { padding: 64px 0 40px; display: grid; grid-template-columns: 1.15fr 1fr; gap: 48px; align-items: end; }
+h1 { font-size: clamp(38px, 5.2vw, 64px); font-weight: 500; letter-spacing: -0.04em; line-height: 1.02; margin: 0; }
+.lede { color: var(--muted); font-size: 17px; line-height: 1.55; margin: 0 0 24px; max-width: 34em; }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; }
+button { font: 500 14px var(--sans); border: 1px solid var(--line); background: var(--surface); color: var(--ink); padding: 12px 18px; cursor: pointer; transition: transform .12s, background .12s, border-color .12s; }
+button:hover { border-color: var(--muted); transform: translateY(-1px); }
+button:active { transform: translateY(0) scale(.98); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:disabled { opacity: .4; cursor: wait; transform: none; }
+button small { font-family: var(--mono); font-size: 11px; opacity: .65; margin-left: 6px; }
+.label { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin: 0 0 14px; }
+section { padding: 32px 0; border-top: 1px solid var(--line); }
+.branches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+.br { background: var(--bg); padding: 22px; min-height: 168px; position: relative; }
+.br .id { font-family: var(--mono); font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+.br .ms { font-family: var(--mono); font-size: 52px; font-weight: 500; letter-spacing: -0.04em; margin: 14px 0 2px; font-variant-numeric: tabular-nums; }
+.br .ms small { font-size: 18px; color: var(--muted); margin-left: 4px; }
+.br .sub { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.br .st { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border: 1px solid var(--line); color: var(--muted); }
+.br .st.running { color: var(--accent); border-color: rgba(218,250,156,.35); }
+.br .st.pass { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.br .st.fail { color: var(--fail); border-color: rgba(255,138,122,.4); }
+.br .note { font-size: 13px; color: var(--muted); margin-top: 10px; line-height: 1.4; }
+.br.live::after { content: ""; position: absolute; left: 0; top: 0; height: 2px; background: var(--accent); animation: scan 1.4s ease-in-out infinite; }
+@keyframes scan { 0% { width: 0; } 60% { width: 100%; opacity: 1; } 100% { width: 100%; opacity: 0; } }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.term { background: #0a0a0a; border: 1px solid var(--line); font-family: var(--mono); font-size: 12px; line-height: 1.7; height: 300px; overflow: auto; padding: 14px 16px; color: var(--muted); white-space: pre; }
+.term .cmd { color: var(--ink); }
+.term .ok { color: var(--accent); }
+.attacks { border: 1px solid var(--line); }
+.atk { display: grid; grid-template-columns: 52px 1fr; gap: 12px; padding: 11px 14px; border-top: 1px solid var(--line); font-size: 14px; align-items: baseline; }
+.atk:first-child { border-top: 0; }
+.atk .r { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.atk.pass .r { color: var(--accent); }
+.atk.fail .r { color: var(--fail); }
+.atk .e { display: block; font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 3px; line-height: 1.5; overflow-wrap: anywhere; }
+.score { font-family: var(--mono); font-size: 13px; color: var(--muted); margin-top: 12px; }
+.score b { color: var(--accent); font-weight: 500; }
+.bars { display: grid; gap: 12px; }
+.bar { display: grid; grid-template-columns: 230px 1fr 90px; gap: 14px; align-items: center; font-size: 14px; }
+.bar .n { color: var(--muted); }
+.bar .n b { color: var(--ink); font-weight: 500; }
+.bar .t { height: 22px; background: var(--surface); position: relative; }
+.bar .f { position: absolute; inset: 0 auto 0 0; width: 0; background: #3a3a3a; transition: width 1s cubic-bezier(.2,.7,.2,1); }
+.bar .f.us { background: var(--accent); }
+.bar .v { font-family: var(--mono); font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; }
+.bar .v.us { color: var(--accent); }
+.foot { font-family: var(--mono); font-size: 11px; color: var(--faint); padding: 28px 0 48px; border-top: 1px solid var(--line); line-height: 1.7; }
+@media (max-width: 860px) {
+  .hero, .two { grid-template-columns: 1fr; }
+  .branches { grid-template-columns: 1fr; }
+  .bar { grid-template-columns: 1fr 70px; }
+  .bar .t { grid-column: 1 / -1; grid-row: 2; }
+}
+@media (prefers-reduced-motion: reduce) { .bar .f { transition: none; } .br.live::after { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <div class="mark">branch<b>vm</b></div>
+    <div class="host"><span class="dot" id="dot"></span><span id="host">connecting to fc-lab</span></div>
+  </nav>
+
+  <div class="hero">
+    <h1>Fork a running dev environment like a git branch.</h1>
+    <div>
+      <p class="lede">Each branch is a Firecracker microVM with its own live Postgres, restored from one snapshot. Every number below comes from this machine, right now.</p>
+      <div class="actions">
+        <button class="primary" data-act="fork">Fork 3 branches<small></small></button>
+        <button data-act="agents">Run 3 agents<small></small></button>
+        <button data-act="attack">Attack from inside<small></small></button>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <p class="label">Live branches</p>
+    <div class="branches" id="branches"></div>
+  </section>
+
+  <section class="two">
+    <div>
+      <p class="label">branchvm output</p>
+      <div class="term" id="term">Click a button to run branchvm on this machine.</div>
+    </div>
+    <div>
+      <p class="label">Isolation attacks</p>
+      <div class="attacks" id="attacks"></div>
+      <div class="score" id="score"></div>
+    </div>
+  </section>
+
+  <section>
+    <p class="label" id="benchlabel">Benchmarks on this machine</p>
+    <div class="bars" id="bars"></div>
+  </section>
+
+  <div class="foot" id="foot">Two Go binaries. Firecracker microVMs, XFS reflink disks, one shared memory snapshot, nftables policy drop per branch.</div>
+</div>
+
+<script>
+const ATTACKS = [["P1","API key theft"],["P2","Firewall escape"],["P3","DNS exfiltration"],["P4","Disk integrity"],["P5","Entropy reuse"],["P6","Resource leaks"]];
+const $ = (id) => document.getElementById(id);
+const term = $("term");
+let branches = {};
+
+function renderBranches() {
+  $("branches").innerHTML = [1,2,3].map((i) => {
+    const b = branches[i] || {};
+    const ms = b.ms ? `${b.ms}<small>ms</small>` : `<span style="color:var(--faint)">--</span>`;
+    const st = b.status || "idle";
+    const live = st === "starting" || st === "running";
+    return `<div class="br${live ? " live" : ""}">
+      <div class="id"><span>branch ${i}  ·  postgres :5432</span><span class="st ${st}">${st}</span></div>
+      <div class="ms">${ms}</div>
+      <div class="sub">restore${b.ram ? `  ·  ${b.ram} MiB host RAM` : ""}</div>
+      ${b.note ? `<div class="note">${b.note}</div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderAttacks(results = {}) {
+  $("attacks").innerHTML = ATTACKS.map(([id, name]) => {
+    const r = results[id];
+    const cls = r ? r.res.toLowerCase() : "";
+    return `<div class="atk ${cls}"><span class="r">${r ? r.res : id}</span><span>${name}${r ? `<span class="e">${r.ev}</span>` : ""}</span></div>`;
+  }).join("");
+}
+let attackResults = {};
+
+function log(line) {
+  if (term.dataset.fresh !== "1") { term.textContent = ""; term.dataset.fresh = "1"; }
+  const div = document.createElement("div");
+  div.textContent = line;
+  if (line.startsWith("$")) div.className = "cmd";
+  if (/PASS|leak check: netns=0 veth=0 firecracker=0/.test(line)) div.className = "ok";
+  term.appendChild(div);
+  term.scrollTop = term.scrollHeight;
+}
+
+function parse(line) {
+  const row = line.match(/^(\d+)\s+(\d+|-)\s+5432\s+(\d+|-)\s+(\w+)\s*(.*)$/);
+  if (row) {
+    const [, i, ms, ram, status, note] = row;
+    const verdict = note.match(/VERDICT branch \d+: (.*?)(?: \(diff|$)/);
+    branches[i] = {
+      ms: ms !== "-" ? ms : (branches[i] || {}).ms,
+      ram: ram !== "-" ? ram : (branches[i] || {}).ram,
+      status,
+      note: verdict ? verdict[1] : (status === "pass" || status === "fail") ? note.replace(/\s*\(diff.*$/, "") : "",
+    };
+    renderBranches();
+    return;
+  }
+  const atk = line.match(/^(P\d)\s+(.+?)\s{2,}(PASS|FAIL)\s+(.*)$/);
+  if (atk) {
+    attackResults[atk[1]] = { res: atk[3], ev: atk[4] };
+    renderAttacks(attackResults);
+  }
+  const score = line.match(/^(\d)\/6 (PASS|FAIL)/);
+  if (score) $("score").innerHTML = `<b>${score[0]}</b>, live inside microVMs`;
+}
+
+function run(act) {
+  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  term.dataset.fresh = "0";
+  if (act !== "attack") { branches = {}; renderBranches(); }
+  else { attackResults = {}; renderAttacks(); $("score").textContent = "restoring 5 clones and attacking..."; }
+  const started = performance.now();
+  const es = new EventSource(`/api/run/${act}`);
+  es.addEventListener("line", (e) => { const l = JSON.parse(e.data); log(l); parse(l); });
+  es.addEventListener("done", () => {
+    es.close(); finish(); loadBench();
+    const secs = (performance.now() - started) / 1000;
+    document.querySelector(`button[data-act="${act}"] small`).textContent = `last run ${secs.toFixed(1)}s`;
+  });
+  es.onerror = () => { es.close(); log("connection closed"); finish(); };
+}
+function finish() { document.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
+document.querySelectorAll("button[data-act]").forEach((b) => b.addEventListener("click", () => run(b.dataset.act)));
+
+function bar(name, value, max, us, unit = "ms") {
+  const pct = Math.max(1.5, (value / max) * 100);
+  return `<div class="bar"><span class="n">${name}</span><span class="t"><span class="f${us ? " us" : ""}" data-w="${pct}"></span></span><span class="v${us ? " us" : ""}">${value.toLocaleString()} ${unit}</span></div>`;
+}
+
+async function loadBench() {
+  try {
+    const b = await (await fetch("/api/bench")).json();
+    if (!b.samples) { $("bars").innerHTML = `<div class="n">Run branchvm bench to fill this in.</div>`; return; }
+    const max = b.coldboot;
+    const d10 = b.density.find((x) => x.clones === 10) || b.density[b.density.length - 1];
+    $("benchlabel").textContent = `Benchmarks on this machine  ·  ${b.samples} samples from branchvm bench, caches dropped before cold runs`;
+    $("bars").innerHTML =
+      bar("<b>branchvm</b> snapshot restore", b.restore, max, true) +
+      bar("<b>branchvm</b> first query, uffd pager", b.pagers.uffd.cold, max, true) +
+      bar("first query, fadvise prefault", b.pagers.fadvise.cold, max, false) +
+      bar("first query, plain mmap", b.pagers.mmap.cold, max, false) +
+      bar("cold boot, same VM", b.coldboot, max, false) +
+      (d10 ? bar(`<b>branchvm</b> RAM per clone, ${d10.clones} running`, d10.per_clone_mb, 1024, true, "MiB") + bar("private copy of guest memory", 1024, 1024, false, "MiB") : "");
+    requestAnimationFrame(() => requestAnimationFrame(() =>
+      document.querySelectorAll(".bar .f").forEach((f) => (f.style.width = f.dataset.w + "%"))));
+  } catch (e) { $("bars").textContent = "bench results unavailable"; }
+}
+
+async function loadHost() {
+  try {
+    const h = await (await fetch("/api/host")).json();
+    $("host").textContent = `fc-lab  ·  ${h.arch}  ·  ${h.cpus} vCPU  ·  ${h.mem_gib} GiB  ·  ${h.firecracker}`;
+    $("dot").classList.add("on");
+  } catch (e) { $("host").textContent = "server offline"; }
+}
+
+renderBranches(); renderAttacks(); loadHost(); loadBench();
+</script>
+</body>
+</html>
