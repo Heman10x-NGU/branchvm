@@ -18,10 +18,17 @@ if [[ "${BRANCHVM_USE_CLAUDE:-0}" == "1" ]] && command -v claude >/dev/null 2>&1
   exit 0
 fi
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-cp -R "$here/." "$work/"
-cd "$work"
+# Inside a branchvm guest the repo is synced to /workspace and the branch
+# diff is read back from there, so the fix must land in place. Anywhere
+# else, patch a throwaway copy to keep the checkout clean.
+if [[ "$here" == /workspace || "$here" == /workspace/* ]]; then
+  cd "$here"
+else
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cp -R "$here/." "$work/"
+  cd "$work"
+fi
 
 if [[ "$idx" != "1" ]]; then
   git apply "fixes/branch${idx}.patch"
