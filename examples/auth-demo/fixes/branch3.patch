@@ -1,0 +1,24 @@
+diff --git a/store.go b/store.go
+index 8fefa7a..da810da 100644
+--- a/store.go
++++ b/store.go
+@@ -9,7 +9,7 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	_ "github.com/lib/pq"
++	"github.com/lib/pq"
+ )
+ 
+ //go:embed schema.sql
+@@ -79,6 +79,10 @@ func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (int
+ 	err = s.db.QueryRowContext(ctx,
+ 		`INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id`,
+ 		email, passwordHash).Scan(&id)
++	var pqErr *pq.Error
++	if errors.As(err, &pqErr) && pqErr.Code == "23505" {
++		return 0, ErrEmailTaken
++	}
+ 	if err != nil {
+ 		return 0, fmt.Errorf("insert user: %w", err)
+ 	}
