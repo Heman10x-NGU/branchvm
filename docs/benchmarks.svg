@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="470" viewBox="0 0 860 470" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title>branchvm benchmark summary</title>
+  <desc>Snapshot restore 190 ms versus 6234 ms cold boot. First database query 1111 ms with the uffd pager. Docker run postgres is typically about 4000 ms. Host RAM at 10 clones: 62 MiB per clone against 1024 MiB for private memory copies. 6 of 6 isolation attacks pass.</desc>
+  <text x="20" y="32" font-size="17" font-weight="600" fill="#2a78d6">branchvm benchmarks</text>
+  <text x="20" y="52" font-size="12" fill="#7d8590">fc-lab: 4 arm64 CPUs, 6 GiB RAM, Firecracker v1.18.0, kernel 6.18 guest. Medians of 10 iterations.</text>
+  <text x="20" y="78" font-size="13" fill="#7d8590">restore vs cold boot <tspan font-weight="600" fill="#2a78d6">32.7x</tspan>   RAM per clone at 10 up <tspan font-weight="600" fill="#2a78d6">62 MiB vs 1024 MiB</tspan>   isolation attacks <tspan font-weight="600" fill="#2a78d6">6/6 pass</tspan>   cost <tspan font-weight="600" fill="#2a78d6">$0/mo</tspan></text>
+
+  <text x="20" y="116" font-size="14" font-weight="600" fill="#7d8590">Time to a sandbox with Postgres answering</text>
+
+  <text x="250" y="144" font-size="12" fill="#7d8590" text-anchor="end">branchvm restore, VM serving</text>
+  <rect x="262" y="132" width="17" height="18" rx="3" fill="#2a78d6"/>
+  <text x="287" y="146" font-size="12" font-weight="600" fill="#2a78d6">190 ms</text>
+
+  <text x="250" y="178" font-size="12" fill="#7d8590" text-anchor="end">branchvm first DB query, uffd</text>
+  <rect x="262" y="166" width="96" height="18" rx="3" fill="#2a78d6"/>
+  <text x="366" y="180" font-size="12" font-weight="600" fill="#2a78d6">1111 ms</text>
+
+  <text x="250" y="212" font-size="12" fill="#7d8590" text-anchor="end">docker run postgres, typical</text>
+  <rect x="262" y="200" width="346" height="18" rx="3" fill="#8b949e"/>
+  <text x="616" y="214" font-size="12" fill="#7d8590">~4 s</text>
+
+  <text x="250" y="246" font-size="12" fill="#7d8590" text-anchor="end">fresh microVM cold boot, measured</text>
+  <rect x="262" y="234" width="540" height="18" rx="3" fill="#8b949e"/>
+  <text x="700" y="247" font-size="12" font-weight="600" fill="#ffffff">6234 ms</text>
+
+  <text x="20" y="296" font-size="14" font-weight="600" fill="#7d8590">Host RAM per running clone, 10 clones up</text>
+
+  <text x="250" y="324" font-size="12" fill="#7d8590" text-anchor="end">branchvm shared snapshot</text>
+  <rect x="262" y="312" width="33" height="18" rx="3" fill="#2a78d6"/>
+  <text x="303" y="326" font-size="12" font-weight="600" fill="#2a78d6">62 MiB</text>
+
+  <text x="250" y="358" font-size="12" fill="#7d8590" text-anchor="end">private memory copies</text>
+  <rect x="262" y="346" width="540" height="18" rx="3" fill="#8b949e"/>
+  <text x="690" y="359" font-size="12" font-weight="600" fill="#ffffff">1024 MiB</text>
+
+  <text x="20" y="400" font-size="12" fill="#7d8590">Pager strategies, cold first query: uffd 1111 ms (29.8 MiB copied), fadvise 1546 ms (395.6 MiB advised), mmap 1601 ms.</text>
+  <text x="20" y="420" font-size="12" fill="#7d8590">Warm: uffd 953 ms, mmap 1473 ms. uffd held ~30 MiB host RAM per guest against ~400 MiB for cold mmap.</text>
+  <text x="20" y="444" font-size="11" fill="#8b949e">Blue bars are branchvm, measured by branchvm bench (124 samples, page caches dropped before cold runs).</text>
+  <text x="20" y="460" font-size="11" fill="#8b949e">The docker bar is a typical published figure, not measured here. Details: BENCHMARKS.md</text>
+</svg>
