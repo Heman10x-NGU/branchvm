@@ -23,11 +23,21 @@ func testStore(t *testing.T) *Store {
 		if dsn == "" {
 			dsn = defaultDSN
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		dbStore, dbErr = OpenStore(ctx, dsn)
-		if dbErr == nil {
-			dbErr = dbStore.Migrate(ctx)
+		// Inside a branch VM several clones compile and test at once, so a
+		// single short ping can time out on load alone. Retry until the
+		// deadline; a genuinely missing database still skips, just slower.
+		deadline := time.Now().Add(45 * time.Second)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			dbStore, dbErr = OpenStore(ctx, dsn)
+			if dbErr == nil {
+				dbErr = dbStore.Migrate(ctx)
+			}
+			cancel()
+			if dbErr == nil || time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(time.Second)
 		}
 	})
 	if dbErr != nil {
