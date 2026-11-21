@@ -93,6 +93,8 @@ P1 ran with the host keys unset, so the substring scan for real keys inside the 
 
 ## Benchmarks
 
+![branchvm benchmark summary: snapshot restore 190 ms vs 6234 ms cold boot, first query 1111 ms with uffd, 62 MiB per clone at 10 clones vs 1024 MiB private copies, 6 of 6 attacks pass](docs/benchmarks.svg)
+
 See [BENCHMARKS.md](BENCHMARKS.md). Every number there comes from `branchvm bench`, with page caches dropped before each cold-cache sample; raw samples are in `results/raw.jsonl`.
 
 ## Limits
