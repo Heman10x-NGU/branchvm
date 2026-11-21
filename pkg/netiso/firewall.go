@@ -145,7 +145,7 @@ func runCmd(cmd *exec.Cmd) error {
 
 func isMissing(err error) bool {
 	s := err.Error()
-	for _, m := range []string{"No such file", "Cannot find device", "does not exist", "not found", "Invalid argument"} {
+	for _, m := range []string{"No such file", "No such device", "Cannot find device", "does not exist", "not found", "Invalid argument"} {
 		if strings.Contains(s, m) {
 			return true
 		}
