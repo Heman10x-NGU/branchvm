@@ -151,6 +151,10 @@ type sampleSpec struct {
 	pre     func() error
 	after   func(context.Context, *pool.Branch) error
 	measure func(*types.BenchRecord, []*pool.Branch)
+	// launchLimit bounds concurrent restores; 0 means all at once. The
+	// density table staggers restores because it measures steady-state
+	// RAM, and N cold restores at once stall a small host for minutes.
+	launchLimit int
 }
 
 func (b *bench) sample(ctx context.Context, s sampleSpec) (types.BenchRecord, error) {
@@ -171,7 +175,7 @@ func (b *bench) sample(ctx context.Context, s sampleSpec) (types.BenchRecord, er
 		lerr = s.pre()
 	}
 	if lerr == nil {
-		brs, lerr = b.launchN(ctx, run, rec.Clones, s.mode, s.after)
+		brs, lerr = b.launchN(ctx, run, rec.Clones, s.mode, s.launchLimit, s.after)
 	}
 	rec.TotalMs = time.Since(start).Milliseconds()
 	if lerr == nil {
@@ -229,13 +233,19 @@ func (r *benchRun) record(bs types.BranchState) {
 	}
 }
 
-func (b *bench) launchN(ctx context.Context, run *benchRun, n int, mode types.RestoreMode, after func(context.Context, *pool.Branch) error) ([]*pool.Branch, error) {
+func (b *bench) launchN(ctx context.Context, run *benchRun, n int, mode types.RestoreMode, limit int, after func(context.Context, *pool.Branch) error) ([]*pool.Branch, error) {
 	brs, errs := make([]*pool.Branch, n), make([]error, n)
+	if limit <= 0 {
+		limit = n
+	}
+	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for i := 1; i <= n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			br, err := pool.LaunchBranch(ctx, run.id, i, b.cfg.memMB, mode, run.record)
 			brs[i-1] = br
 			if err == nil && after != nil {
@@ -403,9 +413,10 @@ func (b *bench) densityTable(ctx context.Context) error {
 		t0 := time.Now()
 		for _, n := range sizes {
 			s := sampleSpec{
-				rec:     types.BenchRecord{Table: "density", Mode: modeRestore, Iteration: it, Clones: n, ColdCache: true},
-				mode:    types.FileRestore,
-				measure: measureDensity,
+				rec:         types.BenchRecord{Table: "density", Mode: modeRestore, Iteration: it, Clones: n, ColdCache: true},
+				mode:        types.FileRestore,
+				measure:     measureDensity,
+				launchLimit: 3,
 			}
 			if err := b.sampleEmit(ctx, s); err != nil {
 				return err
@@ -424,6 +435,7 @@ func (b *bench) densityTable(ctx context.Context) error {
 	if b.densityNote == "" {
 		b.densityNote = fmt.Sprintf("%d iterations per clone count", iters)
 	}
+	b.densityNote += "; restores staggered 3 in flight, since the table measures steady-state RAM and N simultaneous cold restores stall a small host"
 	return nil
 }
 
