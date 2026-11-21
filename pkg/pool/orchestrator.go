@@ -109,10 +109,11 @@ func newRunID() string {
 
 // InitOptions configures Init.
 type InitOptions struct {
-	Repo  string
-	MemMB int64
-	VCPUs int
-	Out   io.Writer
+	Repo    string
+	MemMB   int64
+	VCPUs   int
+	WarmCmd string
+	Out     io.Writer
 }
 
 // Init brings up the XFS pool, cold boots the golden VM from a copy of the
@@ -265,6 +266,9 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 	if err := ensureDatabase(ctx, g); err != nil {
 		return err
 	}
+	if err := warmGolden(ctx, opt, g); err != nil {
+		return err
+	}
 	if err := g.checkpoint(ctx); err != nil {
 		return fmt.Errorf("golden checkpoint: %w", err)
 	}
@@ -272,6 +276,31 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 		return fmt.Errorf("pause golden VM: %w", err)
 	}
 	return writeSnapshot(v)
+}
+
+// warmGolden runs an optional command in the golden /workspace before the
+// checkpoint. Clones inherit its side effects (a hot Go build cache, warmed
+// package data) through the CoW disk, so per-branch commands skip cold work
+// that a 1 GiB guest pays for dearly.
+func warmGolden(ctx context.Context, opt InitOptions, g *guest) error {
+	if opt.WarmCmd == "" {
+		return nil
+	}
+	fmt.Fprintf(opt.Out, "warming golden workspace: %s\n", opt.WarmCmd)
+	start := time.Now()
+	res, err := g.exec(ctx, types.ExecRequest{
+		Cmd:        []string{"sh", "-c", opt.WarmCmd},
+		Env:        []string{"HOME=/root", "GOTOOLCHAIN=local"},
+		TimeoutSec: 900,
+	})
+	if err != nil {
+		return fmt.Errorf("warm command: %w", err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("warm command: exit %d: %s", res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	fmt.Fprintf(opt.Out, "warm done in %.1fs\n", time.Since(start).Seconds())
+	return nil
 }
 
 func ensureDatabase(ctx context.Context, g *guest) error {

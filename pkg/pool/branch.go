@@ -307,6 +307,7 @@ func (b *Branch) Env() []string {
 	gw := "http://" + b.Net.GatewayAddr
 	key := DummyKey(b.Index)
 	return []string{
+		"HOME=/root",
 		fmt.Sprintf("BRANCH_INDEX=%d", b.Index),
 		"ANTHROPIC_BASE_URL=" + gw + "/" + gateway.ProviderAnthropic,
 		"OPENAI_BASE_URL=" + gw + "/" + gateway.ProviderOpenAI + "/v1",
