@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/Heman10x-NGU/branchvm/pkg/pool"
+	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 func init() { commands["run"] = cmdRun }
@@ -19,11 +21,16 @@ func cmdRun(ctx context.Context, args []string) error {
 	repo := fs.String("repo", "", "git repo to sync into each branch (default: current dir)")
 	mem := fs.Int64("mem", 1024, "guest memory in MiB; the cgroup limit adds 256 MiB headroom")
 	timeout := fs.Int("timeout", 600, "per-branch command timeout in seconds")
+	pager := fs.String("pager", "mmap", "snapshot memory pager: mmap, fadvise, or uffd")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 {
 		return errors.New("missing command: branchvm run --branches N -- CMD ARGS...")
+	}
+	mode, err := parsePager(*pager)
+	if err != nil {
+		return err
 	}
 	if err := requireRoot(); err != nil {
 		return err
@@ -33,6 +40,19 @@ func cmdRun(ctx context.Context, args []string) error {
 		return err
 	}
 	return pool.Run(ctx, pool.RunOptions{
-		Repo: dir, Branches: *branches, MemMB: *mem, TimeoutSec: *timeout, Cmd: fs.Args(), Out: os.Stdout,
+		Repo: dir, Branches: *branches, MemMB: *mem, TimeoutSec: *timeout, RestoreMode: mode, Cmd: fs.Args(), Out: os.Stdout,
 	})
+}
+
+func parsePager(name string) (types.RestoreMode, error) {
+	switch name {
+	case "", "mmap", "file":
+		return types.FileRestore, nil
+	case "fadvise", "prefault":
+		return pool.PrefaultRestore, nil
+	case "uffd":
+		return types.UffdRestore, nil
+	default:
+		return "", fmt.Errorf("unknown --pager %q (want mmap, fadvise, or uffd)", name)
+	}
 }

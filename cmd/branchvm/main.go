@@ -14,9 +14,9 @@ import (
 const usage = `usage: branchvm <command> [flags]
 
 commands:
-  init     [--repo DIR] [--mem 1024] [--cpus 2]
+  init     [--repo DIR] [--mem 1024] [--cpus 2] [--warm CMD]
            boot the golden VM, sync the repo, write the golden snapshot
-  run      --branches N [--repo DIR] [--mem 1024] [--timeout 600] -- CMD ARGS...
+  run      --branches N [--repo DIR] [--mem 1024] [--timeout 600] [--pager mmap|fadvise|uffd] -- CMD ARGS...
            restore N branches and run CMD in each; VMs stay up for apply
   apply    <i> [--run RUNID] [--repo DIR]
            apply branch i's diff to the repo, then tear the whole run down

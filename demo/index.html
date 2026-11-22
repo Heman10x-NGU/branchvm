@@ -95,7 +95,9 @@ section { padding: 32px 0; border-top: 1px solid var(--line); }
       <div class="actions">
         <button class="primary" data-act="fork">Fork 3 branches<small></small></button>
         <button data-act="agents">Run 3 agents<small></small></button>
+        <button data-act="apply" id="btn-apply" disabled>Apply branch 2<small></small></button>
         <button data-act="attack">Attack from inside<small></small></button>
+        <button data-act="reset" id="btn-reset" disabled>Reset repo<small></small></button>
       </div>
     </div>
   </div>
@@ -188,22 +190,41 @@ function parse(line) {
   if (score) $("score").innerHTML = `<b>${score[0]}</b>, live inside microVMs`;
 }
 
+let activeRun = null;
+let demoDirty = false;
+
+function syncButtons(busy = false) {
+  document.querySelectorAll("button[data-act]").forEach((b) => {
+    const act = b.dataset.act;
+    if (busy) { b.disabled = true; return; }
+    if (act === "apply") b.disabled = !activeRun;
+    else if (act === "reset") b.disabled = !demoDirty && !activeRun;
+    else b.disabled = false;
+  });
+}
+
 function run(act) {
-  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  syncButtons(true);
   term.dataset.fresh = "0";
-  if (act !== "attack") { branches = {}; renderBranches(); }
-  else { attackResults = {}; renderAttacks(); $("score").textContent = "restoring 5 clones and attacking..."; }
+  if (act === "fork" || act === "agents" || act === "reset") { branches = {}; renderBranches(); }
+  if (act === "attack") { attackResults = {}; renderAttacks(); $("score").textContent = "restoring 5 clones and attacking..."; }
   const started = performance.now();
   const es = new EventSource(`/api/run/${act}`);
   es.addEventListener("line", (e) => { const l = JSON.parse(e.data); log(l); parse(l); });
-  es.addEventListener("done", () => {
-    es.close(); finish(); loadBench();
+  es.addEventListener("done", (e) => {
+    es.close();
+    try {
+      const info = JSON.parse(e.data);
+      activeRun = info.active_run || null;
+      demoDirty = Boolean(info.demo_dirty);
+    } catch (_) {}
+    syncButtons(false);
+    loadBench();
     const secs = (performance.now() - started) / 1000;
     document.querySelector(`button[data-act="${act}"] small`).textContent = `last run ${secs.toFixed(1)}s`;
   });
-  es.onerror = () => { es.close(); log("connection closed"); finish(); };
+  es.onerror = () => { es.close(); log("connection closed"); syncButtons(false); };
 }
-function finish() { document.querySelectorAll("button").forEach((b) => (b.disabled = false)); }
 document.querySelectorAll("button[data-act]").forEach((b) => b.addEventListener("click", () => run(b.dataset.act)));
 
 function bar(name, value, max, us, unit = "ms") {
@@ -235,6 +256,9 @@ async function loadHost() {
     const h = await (await fetch("/api/host")).json();
     $("host").textContent = `fc-lab  ·  ${h.arch}  ·  ${h.cpus} vCPU  ·  ${h.mem_gib} GiB  ·  ${h.firecracker}`;
     $("dot").classList.add("on");
+    activeRun = h.active_run || null;
+    demoDirty = Boolean(h.demo_dirty);
+    syncButtons(false);
   } catch (e) { $("host").textContent = "server offline"; }
 }
 

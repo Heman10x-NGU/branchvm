@@ -400,12 +400,13 @@ func requireGolden() error {
 
 // RunOptions configures Run.
 type RunOptions struct {
-	Repo       string
-	Branches   int
-	MemMB      int64
-	TimeoutSec int
-	Cmd        []string
-	Out        io.Writer
+	Repo        string
+	Branches    int
+	MemMB       int64
+	TimeoutSec  int
+	RestoreMode types.RestoreMode
+	Cmd         []string
+	Out         io.Writer
 }
 
 // Run restores N branches concurrently, runs Cmd in each, stores each diff,
@@ -450,7 +451,11 @@ func Run(ctx context.Context, opt RunOptions) error {
 
 func runBranch(ctx context.Context, rec *recorder, tab *table, opt RunOptions, tgz []byte, i int) *Branch {
 	tab.update(i, func(r *row) { r.status = StatusStarting })
-	b, err := launchBranch(ctx, rec.runID(), i, opt.MemMB, rec.set)
+	mode := opt.RestoreMode
+	if mode == "" {
+		mode = types.FileRestore
+	}
+	b, err := LaunchBranch(ctx, rec.runID(), i, opt.MemMB, mode, rec.set)
 	if err != nil {
 		rec.setStatus(i, StatusError)
 		tab.update(i, func(r *row) { r.status, r.note = StatusError, err.Error() })

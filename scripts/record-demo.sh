@@ -17,11 +17,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT/examples/auth-demo"
-BIN="${BRANCHVM:-$ROOT/branchvm}"
+if [[ -n "${BRANCHVM:-}" ]]; then
+  BIN="$BRANCHVM"
+elif [[ -x "$ROOT/branchvm" ]]; then
+  BIN="$ROOT/branchvm"
+elif [[ -x "$ROOT/bin/branchvm" ]]; then
+  BIN="$ROOT/bin/branchvm"
+else
+  BIN="$ROOT/branchvm"
+fi
 CAST="${1:-demo.cast}"
 PAUSE="${DEMO_PAUSE:-2}"
 WARM="${DEMO_WARM:-go test -run ^\$ ./...}"
 GOLDEN=/var/lib/branchvm/pool/golden/snapshot
+VERIFY_KEY="${ANTHROPIC_API_KEY:-sk-ant-demo-sentinel-never-in-guest}"
 
 if [[ -z "${BVM_DEMO_INNER:-}" ]] && command -v asciinema >/dev/null 2>&1; then
   echo "recording to $CAST with asciinema"
@@ -64,14 +73,17 @@ fi
 banner "restore 3 branches from one snapshot; each agent tries a different fix"
 step sudo -E "$BIN" run --branches 3 -- ./demo-agents.sh
 
+banner "host repo is still untouched"
+step git -C "$ROOT" status --short -- examples/auth-demo
+
 banner "promote branch 2 into the host repo; the run is torn down"
 step sudo -E "$BIN" apply 2
 
 banner "what landed"
-step git -C "$ROOT" diff --stat
+step git -C "$ROOT" diff --stat -- examples/auth-demo
 
 banner "fire 6 isolation attacks at 5 fresh branches"
-step sudo "$BIN" verify --repo .
+step sudo ANTHROPIC_API_KEY="$VERIFY_KEY" "$BIN" verify --repo .
 
 printf '\n\033[1mdone.\033[0m revert the demo change with: git checkout -- examples/auth-demo\n'
 sleep "$PAUSE"
