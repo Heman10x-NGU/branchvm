@@ -17,6 +17,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,15 +26,32 @@ import (
 // MaxBodyBytes caps the request body forwarded upstream.
 const MaxBodyBytes = 25 << 20
 
-// Provider route names. They are also the keys of Config.Upstreams.
+// Built-in provider route names. They are also the keys of Config.Upstreams.
 const (
-	ProviderAnthropic = "anthropic"
-	ProviderOpenAI    = "openai"
+	ProviderAnthropic  = "anthropic"
+	ProviderOpenAI     = "openai"
+	ProviderOpenRouter = "openrouter"
 )
 
-var defaultUpstreams = map[string]string{
-	ProviderAnthropic: "https://api.anthropic.com",
-	ProviderOpenAI:    "https://api.openai.com",
+var providerNameRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+
+type builtinSpec struct {
+	upstream   string
+	authHeader string
+}
+
+var defaultUpstreams = map[string]builtinSpec{
+	ProviderAnthropic:  {upstream: "https://api.anthropic.com", authHeader: "X-Api-Key"},
+	ProviderOpenAI:     {upstream: "https://api.openai.com", authHeader: "Authorization"},
+	ProviderOpenRouter: {upstream: "https://openrouter.ai/api", authHeader: "Authorization"},
+}
+
+// ProviderRoute configures an extra upstream API route on the gateway.
+type ProviderRoute struct {
+	Name       string
+	Upstream   string
+	Key        string
+	AuthHeader string // "Authorization" (default) or "X-Api-Key"
 }
 
 // Config configures a Gateway.
@@ -43,18 +62,28 @@ type Config struct {
 	AllowLoopbackForTest bool
 	// BranchKey is the dummy key the guest must present, e.g. bvm_dummy_3.
 	BranchKey string
-	// AnthropicKey and OpenAIKey are the real keys, read from the host env.
-	AnthropicKey string
-	OpenAIKey    string
-	// Upstreams overrides provider base URLs, keyed by provider name. Tests only.
+	// AnthropicKey, OpenAIKey, and OpenRouterKey are the real keys read from host env.
+	AnthropicKey  string
+	OpenAIKey     string
+	OpenRouterKey string
+	// ExtraProviders registers custom routes defined in branchvm.toml.
+	ExtraProviders []ProviderRoute
+	// Upstreams overrides built-in provider base URLs, keyed by provider name. Tests only.
 	Upstreams map[string]string
+}
+
+type activeRoute struct {
+	upstream   *url.URL
+	key        string
+	authHeader string
 }
 
 // Gateway is a key-injecting reverse proxy for a single branch.
 type Gateway struct {
-	cfg       Config
-	upstreams map[string]*url.URL
-	proxy     *httputil.ReverseProxy
+	cfg        Config
+	routes     map[string]activeRoute
+	routeNames []string
+	proxy      *httputil.ReverseProxy
 }
 
 type ctxKey struct{}
@@ -72,27 +101,74 @@ func New(cfg Config) (*Gateway, error) {
 	if cfg.BranchKey == "" {
 		return nil, errors.New("gateway: BranchKey is required")
 	}
-	ups := make(map[string]*url.URL, len(defaultUpstreams))
-	for name, raw := range defaultUpstreams {
+
+	routes := make(map[string]activeRoute, len(defaultUpstreams)+len(cfg.ExtraProviders))
+	builtinKeys := map[string]string{
+		ProviderAnthropic:  cfg.AnthropicKey,
+		ProviderOpenAI:     cfg.OpenAIKey,
+		ProviderOpenRouter: cfg.OpenRouterKey,
+	}
+	for name, spec := range defaultUpstreams {
+		raw := spec.upstream
 		if o, ok := cfg.Upstreams[name]; ok {
 			raw = o
 		}
-		u, err := url.Parse(raw)
+		u, err := parseUpstreamURL(name, raw)
 		if err != nil {
-			return nil, fmt.Errorf("gateway: upstream %s: %w", name, err)
+			return nil, err
 		}
-		if u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("gateway: upstream %s: missing scheme or host", name)
-		}
-		ups[name] = u
+		routes[name] = activeRoute{upstream: u, key: builtinKeys[name], authHeader: spec.authHeader}
 	}
-	g := &Gateway{cfg: cfg, upstreams: ups}
+
+	for _, ep := range cfg.ExtraProviders {
+		if !providerNameRe.MatchString(ep.Name) {
+			return nil, fmt.Errorf("gateway: invalid provider name %q", ep.Name)
+		}
+		if _, dup := routes[ep.Name]; dup {
+			return nil, fmt.Errorf("gateway: duplicate provider route %q", ep.Name)
+		}
+		u, err := parseUpstreamURL(ep.Name, ep.Upstream)
+		if err != nil {
+			return nil, err
+		}
+		hdr := ep.AuthHeader
+		if hdr == "" {
+			hdr = "Authorization"
+		}
+		if hdr != "Authorization" && hdr != "X-Api-Key" {
+			return nil, fmt.Errorf("gateway: provider %s auth_header %q must be Authorization or X-Api-Key", ep.Name, hdr)
+		}
+		routes[ep.Name] = activeRoute{upstream: u, key: ep.Key, authHeader: hdr}
+	}
+
+	names := make([]string, 0, len(routes))
+	for name := range routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	g := &Gateway{cfg: cfg, routes: routes, routeNames: names}
 	g.proxy = &httputil.ReverseProxy{
-		Rewrite:      g.rewrite,
-		ErrorHandler: proxyError,
-		ErrorLog:     log.New(io.Discard, "", 0),
+		Rewrite:       g.rewrite,
+		FlushInterval: -1,
+		ErrorHandler:  proxyError,
+		ErrorLog:      log.New(io.Discard, "", 0),
 	}
 	return g, nil
+}
+
+func parseUpstreamURL(name, raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("gateway: upstream %s: %w", name, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("gateway: upstream %s: must be http(s) URL with host", name)
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return nil, fmt.Errorf("gateway: upstream %s: link-local address %s is not allowed", name, u.Hostname())
+	}
+	return u, nil
 }
 
 func validateListenAddr(addr string, allowLoopback bool) error {
@@ -149,12 +225,14 @@ func (g *Gateway) Serve(ctx context.Context) error {
 // ServeHTTP authenticates, routes, and proxies one request.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !g.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		http.Error(w, "unauthorized: present branch dummy token in x-api-key or Authorization Bearer", http.StatusUnauthorized)
 		return
 	}
-	rt, ok := parseRoute(r.URL)
+	rt, ok := g.parseRoute(r.URL)
 	if !ok {
-		http.Error(w, "forbidden", http.StatusForbidden)
+		msg := fmt.Sprintf("forbidden: path %q is not an allowlisted provider route (%s); configure [providers.<name>] in branchvm.toml for custom endpoints",
+			r.URL.Path, strings.Join(g.routeNames, ", "))
+		http.Error(w, msg, http.StatusForbidden)
 		return
 	}
 	if r.ContentLength > MaxBodyBytes {
@@ -179,15 +257,15 @@ func (g *Gateway) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(tok), want) == 1
 }
 
-// parseRoute accepts only /anthropic/<rest> and /openai/<rest> with no dot
+// parseRoute accepts only registered /<provider>/<rest> paths with no dot
 // segments, checked on both the decoded and the raw path.
-func parseRoute(u *url.URL) (route, bool) {
+func (g *Gateway) parseRoute(u *url.URL) (route, bool) {
 	for _, p := range []string{u.Path, u.EscapedPath()} {
 		if hasDotSegment(p) {
 			return route{}, false
 		}
 	}
-	for _, name := range []string{ProviderAnthropic, ProviderOpenAI} {
+	for _, name := range g.routeNames {
 		rest, ok := strings.CutPrefix(u.Path, "/"+name+"/")
 		if ok && rest != "" {
 			return route{provider: name, rest: rest}, true
@@ -211,7 +289,8 @@ func hasDotSegment(p string) bool {
 
 func (g *Gateway) rewrite(pr *httputil.ProxyRequest) {
 	rt, _ := pr.In.Context().Value(ctxKey{}).(route)
-	target := g.upstreams[rt.provider]
+	ar := g.routes[rt.provider]
+	target := ar.upstream
 	out := pr.Out
 	out.URL.Scheme = target.Scheme
 	out.URL.Host = target.Host
@@ -224,11 +303,11 @@ func (g *Gateway) rewrite(pr *httputil.ProxyRequest) {
 	out.Header.Del("X-Api-Key")
 	out.Header.Del("Cookie")
 	out.Header.Del("Proxy-Authorization")
-	switch rt.provider {
-	case ProviderAnthropic:
-		out.Header.Set("X-Api-Key", g.cfg.AnthropicKey)
-	case ProviderOpenAI:
-		out.Header.Set("Authorization", "Bearer "+g.cfg.OpenAIKey)
+	switch ar.authHeader {
+	case "X-Api-Key":
+		out.Header.Set("X-Api-Key", ar.key)
+	default:
+		out.Header.Set("Authorization", "Bearer "+ar.key)
 	}
 }
 
@@ -238,5 +317,5 @@ func proxyError(w http.ResponseWriter, _ *http.Request, err error) {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	http.Error(w, "upstream unavailable: gateway could not reach configured provider endpoint", http.StatusBadGateway)
 }
