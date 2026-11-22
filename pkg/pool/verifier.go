@@ -68,9 +68,20 @@ func Verify(ctx context.Context, opt VerifyOptions) (bool, error) {
 	if err := requireGolden(); err != nil {
 		return false, err
 	}
+	meta, _, err := loadGoldenMeta()
+	if err != nil {
+		return false, err
+	}
+	memMB := max(int64(verifyMemMB), meta.MemMB)
+	bcfg := branchConfigFromMeta(meta)
+
 	tgz, err := storage.PackWorkspace(opt.Repo)
 	if err != nil {
 		return false, fmt.Errorf("pack workspace %s: %w", opt.Repo, err)
+	}
+	body, ctype, err := storage.EncodeSyncMultipart(types.SyncMeta{Mode: "full"}, tgz)
+	if err != nil {
+		return false, err
 	}
 	goldenBefore, err := sha256File(goldenRootfs())
 	if err != nil {
@@ -81,12 +92,12 @@ func Verify(ctx context.Context, opt VerifyOptions) (bool, error) {
 	cgroup.InstallCleanupTrap(cancel)
 	rec := newRecorder(newRunID(), verifyBranches, opt.Out)
 	fmt.Fprintf(opt.Out, "verify run %s: restoring %d branches\n", rec.runID(), verifyBranches)
-	vbs := launchVerifyBranches(ctx, rec, tgz)
+	vbs := launchVerifyBranches(ctx, rec, memMB, bcfg, ctype, body)
 	checks := []Check{
 		checkEnvKey(ctx, vbs[0]),
 		checkFirewall(ctx, vbs[0]),
 		checkDNS(ctx, vbs[0]),
-		checkCoW(ctx, vbs, goldenBefore),
+		checkCoW(ctx, vbs, goldenBefore, meta),
 		checkEntropy(vbs),
 	}
 	checks = append(checks, checkTeardown(rec.snapshot(), vbs))
@@ -95,7 +106,7 @@ func Verify(ctx context.Context, opt VerifyOptions) (bool, error) {
 
 // launchVerifyBranches samples /entropy right after each restore, before
 // any exec, so guest activity cannot mask a missing VMGenID reseed.
-func launchVerifyBranches(ctx context.Context, rec *recorder, tgz []byte) []verifyBranch {
+func launchVerifyBranches(ctx context.Context, rec *recorder, memMB int64, bcfg BranchConfig, ctype string, body []byte) []verifyBranch {
 	vbs := make([]verifyBranch, verifyBranches)
 	var wg sync.WaitGroup
 	for i := 1; i <= verifyBranches; i++ {
@@ -103,14 +114,14 @@ func launchVerifyBranches(ctx context.Context, rec *recorder, tgz []byte) []veri
 		go func(i int) {
 			defer wg.Done()
 			vb := &vbs[i-1]
-			vb.b, vb.err = launchBranch(ctx, rec.runID(), i, verifyMemMB, rec.set)
+			vb.b, vb.err = LaunchBranchConfigured(ctx, rec.runID(), i, memMB, types.FileRestore, bcfg, rec.set)
 			if vb.err != nil {
 				rec.setStatus(i, StatusError)
 				return
 			}
 			rec.set(vb.b.State(StatusRunning))
 			vb.ent, vb.entErr = vb.b.Guest.entropy(ctx)
-			if err := vb.b.Guest.sync(ctx, tgz); err != nil {
+			if err := vb.b.SyncMultipart(ctx, ctype, body); err != nil {
 				vb.err = fmt.Errorf("branch %d sync: %w", i, err)
 			}
 		}(i)
@@ -126,8 +137,6 @@ func (vb verifyBranch) exec(ctx context.Context, argv ...string) (types.ExecResp
 	return vb.b.Exec(ctx, argv, probeTimeoutSec)
 }
 
-// blocked is true for a probe that ran and failed. Exit 127 means the tool
-// is missing, which proves nothing about the firewall.
 func blocked(res types.ExecResponse) bool {
 	return res.ExitCode != 0 && res.ExitCode != exitNotFound
 }
@@ -145,7 +154,7 @@ func checkEnvKey(ctx context.Context, vb verifyBranch) Check {
 	}
 	got := strings.TrimSpace(res.Stdout)
 	var checked, leaked []string
-	for _, name := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY"} {
+	for _, name := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"} {
 		hostKey := os.Getenv(name)
 		if hostKey == "" {
 			continue
@@ -179,7 +188,6 @@ func checkFirewall(ctx context.Context, vb verifyBranch) Check {
 		u, _ := url.Parse(t)
 		parts = append(parts, fmt.Sprintf("%s exit=%d", u.Host, res.ExitCode))
 	}
-	// Control: the one allowed path must work, or the drops above prove nothing.
 	gw := fmt.Sprintf("http://%s:%d/anthropic/v1/models", netiso.HostIP(1), netiso.GatewayPort)
 	ctl, err := vb.exec(ctx, "curl", "--max-time", "10", "-s", "-o", "/dev/null", "-w", "%{http_code}",
 		"-H", "x-api-key: "+DummyKey(1), gw)
@@ -217,9 +225,14 @@ func checkDNS(ctx context.Context, vb verifyBranch) Check {
 	return c
 }
 
-func checkCoW(ctx context.Context, vbs []verifyBranch, goldenBefore string) Check {
+func checkCoW(ctx context.Context, vbs []verifyBranch, goldenBefore string, meta types.GoldenMeta) Check {
 	c := Check{ID: "P4", Name: "cow-disk"}
-	if err := writeDistinct(ctx, vbs); err != nil {
+	withDB := hasPostgres(meta.Services)
+	dbName := meta.Database
+	if dbName == "" {
+		dbName = "postgres"
+	}
+	if err := writeDistinct(ctx, vbs, withDB, dbName); err != nil {
 		return c.failed(err)
 	}
 	goldenAfter, err := sha256File(goldenRootfs())
@@ -246,14 +259,16 @@ func checkCoW(ctx context.Context, vbs []verifyBranch, goldenBefore string) Chec
 	for i, h := range clones {
 		short[i] = h[:12]
 	}
-	c.Evidence = fmt.Sprintf("golden sha256 before=%s after=%s unchanged=%t; %d clone sha256 pairwise distinct=%t [%s]; each DB saw only its own row",
-		goldenBefore[:12], goldenAfter[:12], unchanged, len(clones), distinct, strings.Join(short, " "))
+	dbNote := "each DB saw only its own row"
+	if !withDB {
+		dbNote = "stateless image (disk CoW verified without DB)"
+	}
+	c.Evidence = fmt.Sprintf("golden sha256 before=%s after=%s unchanged=%t; %d clone sha256 pairwise distinct=%t [%s]; %s",
+		goldenBefore[:12], goldenAfter[:12], unchanged, len(clones), distinct, strings.Join(short, " "), dbNote)
 	return c
 }
 
-// writeDistinct writes a distinct 1 MiB file and DB row in every branch,
-// checks each DB sees only its own row, and syncs the guest disk.
-func writeDistinct(ctx context.Context, vbs []verifyBranch) error {
+func writeDistinct(ctx context.Context, vbs []verifyBranch, withDB bool, dbName string) error {
 	errs := make([]error, len(vbs))
 	var wg sync.WaitGroup
 	for i, vb := range vbs {
@@ -261,18 +276,25 @@ func writeDistinct(ctx context.Context, vbs []verifyBranch) error {
 		go func(i int, vb verifyBranch) {
 			defer wg.Done()
 			idx := i + 1
-			script := fmt.Sprintf(`set -e
+			var script string
+			if withDB {
+				script = fmt.Sprintf(`set -e
 yes branchvm-p4-branch-%[1]d | dd of=/var/tmp/bvm-p4.bin bs=1M count=1 iflag=fullblock status=none
 psql -h 127.0.0.1 -U postgres -d %[2]s -v ON_ERROR_STOP=1 -qc "CREATE TABLE IF NOT EXISTS bvm_scratch (branch int); INSERT INTO bvm_scratch VALUES (%[1]d);"
 psql -h 127.0.0.1 -U postgres -d %[2]s -tAc "SELECT string_agg(branch::text, ',') FROM bvm_scratch"
-sync`, idx, databaseName)
+sync`, idx, dbName)
+			} else {
+				script = fmt.Sprintf(`set -e
+yes branchvm-p4-branch-%d | dd of=/var/tmp/bvm-p4.bin bs=1M count=1 iflag=fullblock status=none
+sync`, idx)
+			}
 			res, err := vb.exec(ctx, "sh", "-c", script)
 			switch {
 			case err != nil:
 				errs[i] = fmt.Errorf("branch %d write: %w", idx, err)
 			case res.ExitCode != 0:
 				errs[i] = fmt.Errorf("branch %d write: exit %d: %s", idx, res.ExitCode, strings.TrimSpace(res.Stderr))
-			case lastLine(res.Stdout) != strconv.Itoa(idx):
+			case withDB && lastLine(res.Stdout) != strconv.Itoa(idx):
 				errs[i] = fmt.Errorf("branch %d DB rows %q, want only %d", idx, lastLine(res.Stdout), idx)
 			}
 		}(i, vb)
