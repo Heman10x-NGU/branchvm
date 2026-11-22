@@ -44,23 +44,31 @@ jobs:
           tar -czf "${NAME}" -C dist branchvm execd scripts/fetch-assets.sh
           sha256sum "${NAME}" > "${NAME}.sha256"
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: release-${{ matrix.goarch }}
+          path: |
             branchvm_${{ github.ref_name }}_linux_${{ matrix.goarch }}.tar.gz
             branchvm_${{ github.ref_name }}_linux_${{ matrix.goarch }}.tar.gz.sha256
 
-  checksums:
+  release:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - name: Download release artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          mkdir -p sums
-          gh release download "${TAG}" -D sums -p "*.tar.gz"
-          (cd sums && sha256sum *.tar.gz > SHA256SUMS)
-          gh release upload "${TAG}" sums/SHA256SUMS --clobber
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: (cd release-assets && sha256sum *.tar.gz > SHA256SUMS)
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.tar.gz.sha256
+            release-assets/SHA256SUMS

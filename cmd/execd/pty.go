@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -131,16 +132,30 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	var (
+		exited    atomic.Bool
+		killMu    sync.Mutex
+		killTimer *time.Timer
+	)
+
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
 		for {
 			kind, payload, err := types.ReadPTYFrame(rw.Reader)
 			if err != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
-				time.AfterFunc(250*time.Millisecond, func() {
-					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				})
+				if !exited.Load() {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP)
+					killMu.Lock()
+					if !exited.Load() {
+						killTimer = time.AfterFunc(250*time.Millisecond, func() {
+							if !exited.Load() {
+								_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+							}
+						})
+					}
+					killMu.Unlock()
+				}
 				return
 			}
 			switch kind {
@@ -161,7 +176,19 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	waitErr := a.procs.wait(cmd)
-	<-masterDone
+	exited.Store(true)
+	killMu.Lock()
+	if killTimer != nil {
+		killTimer.Stop()
+	}
+	killMu.Unlock()
+
+	select {
+	case <-masterDone:
+	case <-time.After(200 * time.Millisecond):
+		_ = master.Close()
+		<-masterDone
+	}
 
 	exitCode := 0
 	var exitErr *exec.ExitError

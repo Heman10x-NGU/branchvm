@@ -124,6 +124,13 @@ func TestSafeStagePathSymlinkContainment(t *testing.T) {
 	if !strings.HasPrefix(resolvedEscape, staging+string(os.PathSeparator)) {
 		t.Fatalf("resolved path %q escaped staging %q", resolvedEscape, staging)
 	}
+
+	if err := os.Symlink("../../../../", filepath.Join(staging, "toRoot")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveInsideStaging(staging, "/toRoot", true); err == nil {
+		t.Fatal("expected error for symlink resolving to staging root")
+	}
 }
 
 func TestStageGuestOverlay(t *testing.T) {
@@ -205,5 +212,16 @@ func TestResolveDockerfileContainment(t *testing.T) {
 	}
 	if _, _, err := ResolveDockerfile(repo, "../outside/Dockerfile"); err == nil {
 		t.Fatal("expected containment error for ../outside/Dockerfile")
+	}
+
+	outside := filepath.Join(t.TempDir(), "OutsideDockerfile")
+	if err := os.WriteFile(outside, []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, "EscapeDockerfile")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ResolveDockerfile(repo, "EscapeDockerfile"); err == nil {
+		t.Fatal("expected containment error for symlinked EscapeDockerfile")
 	}
 }

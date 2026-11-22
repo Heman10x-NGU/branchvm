@@ -165,6 +165,9 @@ func parseUpstreamURL(name, raw string) (*url.URL, error) {
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("gateway: upstream %s: must be http(s) URL with host", name)
 	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return nil, fmt.Errorf("gateway: upstream %s: link-local address %s is not allowed", name, u.Hostname())
+	}
 	return u, nil
 }
 

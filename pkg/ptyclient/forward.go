@@ -24,6 +24,7 @@ func Forward(ctx context.Context, guestAPIAddr string, guestPort, hostPort int, 
 	if err != nil {
 		return fmt.Errorf("listen 127.0.0.1:%d: %w", hostPort, err)
 	}
+	defer ln.Close()
 	if ready != nil {
 		ready(ln.Addr().(*net.TCPAddr).Port)
 	}
@@ -60,6 +61,17 @@ func proxyOneConn(ctx context.Context, guestAPIAddr string, guestPort int, clien
 	}
 	defer remote.Close()
 
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = client.Close()
+			_ = remote.Close()
+		case <-done:
+		}
+	}()
+
 	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://%s/tcp?port=%d", guestAPIAddr, guestPort), nil)
 	if err != nil {
 		return
@@ -80,17 +92,6 @@ func proxyOneConn(ctx context.Context, guestAPIAddr string, guestPort int, clien
 		_ = resp.Body.Close()
 		return
 	}
-
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = client.Close()
-			_ = remote.Close()
-		case <-done:
-		}
-	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)

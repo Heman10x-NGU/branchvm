@@ -74,6 +74,7 @@ type agent struct {
 
 	svcMu    sync.Mutex
 	svcState map[string]bool
+	svcDead  map[string]bool
 
 	credMu     sync.Mutex
 	pgCred     *syscall.Credential
@@ -90,6 +91,7 @@ func main() {
 		start:    time.Now(),
 		procs:    newProcTable(),
 		svcState: map[string]bool{},
+		svcDead:  map[string]bool{},
 	}
 	a.imageEnv = loadImageEnv(imageEnvPath)
 	a.services = loadServiceSpecs(servicesSpecPath, func(err error) {
