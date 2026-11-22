@@ -1,8 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Installs branchvm and static execd on Linux (amd64 or arm64).
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Heman10x-NGU/branchvm/main/scripts/install.sh | sudo sh
-set -euo pipefail
+set -eu
 
 REPO="${BRANCHVM_REPO:-Heman10x-NGU/branchvm}"
 VERSION="${VERSION:-latest}"
@@ -12,8 +12,8 @@ SHARE_DIR="${SHARE_DIR:-/usr/local/share/branchvm}"
 
 die() { echo "branchvm install: $*" >&2; exit 1; }
 
-[[ "$(uname -s)" == "Linux" ]] || die "requires Linux with KVM (on macOS, use scripts/setup-lima.sh first)"
-[[ "$(id -u)" -eq 0 ]] || die "must run as root (pipe to sudo sh)"
+[ "$(uname -s)" = "Linux" ] || die "requires Linux with KVM (on macOS, use scripts/setup-lima.sh first)"
+[ "$(id -u)" -eq 0 ] || die "must run as root (pipe to sudo sh)"
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -22,13 +22,13 @@ case "$(uname -m)" in
 esac
 
 for tool in curl tar sha256sum; do
-  command -v "$tool" >/dev/null || die "missing required tool: $tool"
+  command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 
-if [[ "$VERSION" == "latest" ]]; then
+if [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
   TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  [[ -n "$TAG" ]] || die "could not resolve latest release tag for ${REPO}"
+  [ -n "$TAG" ] || die "could not resolve latest release tag for ${REPO}"
 else
   TAG="$VERSION"
   BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
@@ -38,7 +38,7 @@ TARBALL="branchvm_${TAG}_linux_${ARCH}.tar.gz"
 SUMFILE="${TARBALL}.sha256"
 
 TMP="$(mktemp -d /tmp/branchvm-install.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+trap '[ -n "${TMP:-}" ] && rm -rf "$TMP"' EXIT
 
 echo "downloading ${TARBALL} from ${REPO} (${TAG})..."
 curl -fsSL -o "${TMP}/${TARBALL}" "${BASE_URL}/${TARBALL}"

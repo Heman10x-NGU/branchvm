@@ -188,6 +188,12 @@ func TestExtraProvidersAndValidation(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected invalid provider name rejection")
 	}
+	if _, err := New(Config{
+		ListenAddr: "127.0.0.1:18080", AllowLoopbackForTest: true, BranchKey: dummyKey,
+		ExtraProviders: []ProviderRoute{{Name: "imds", Upstream: "http://169.254.169.254/latest"}},
+	}); err == nil {
+		t.Fatal("expected link-local IMDS upstream rejection")
+	}
 
 	g, err := New(Config{
 		ListenAddr:           "127.0.0.1:18080",
