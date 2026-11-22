@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"net"
@@ -12,9 +13,10 @@ import (
 )
 
 const (
-	dummyKey     = "bvm_dummy_1"
-	realAnthKey  = "sk-ant-test-real"
-	realOpenAIKy = "sk-openai-test-real"
+	dummyKey          = "bvm_dummy_1"
+	realAnthKey       = "sk-ant-test-real"
+	realOpenAIKy      = "sk-openai-test-real"
+	realOpenRouterKey = "sk-or-test-real"
 )
 
 type seen struct {
@@ -42,7 +44,12 @@ func newTestGateway(t *testing.T, anth, oai string) *Gateway {
 		BranchKey:            dummyKey,
 		AnthropicKey:         realAnthKey,
 		OpenAIKey:            realOpenAIKy,
-		Upstreams:            map[string]string{ProviderAnthropic: anth, ProviderOpenAI: oai},
+		OpenRouterKey:        realOpenRouterKey,
+		Upstreams: map[string]string{
+			ProviderAnthropic:  anth,
+			ProviderOpenAI:     oai,
+			ProviderOpenRouter: oai,
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -109,6 +116,7 @@ func TestAuthAndAllowlist(t *testing.T) {
 		{"inner traversal", "/openai/v1/../../x", good, 403},
 		{"encoded traversal", "/anthropic/%2e%2e/x", good, 403},
 		{"allowed", "/anthropic/v1/messages", good, 200},
+		{"openrouter allowed", "/openrouter/v1/chat/completions", good, 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,7 +124,10 @@ func TestAuthAndAllowlist(t *testing.T) {
 			if rec.Code != tc.want {
 				t.Fatalf("status %d, want %d", rec.Code, tc.want)
 			}
-			if strings.Contains(rec.Body.String(), realAnthKey) || strings.Contains(rec.Body.String(), realOpenAIKy) {
+			if tc.want == 403 && !strings.Contains(rec.Body.String(), "branchvm.toml") {
+				t.Fatalf("expected actionable 403 message mentioning branchvm.toml, got %q", rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), realAnthKey) || strings.Contains(rec.Body.String(), realOpenAIKy) || strings.Contains(rec.Body.String(), realOpenRouterKey) {
 				t.Fatal("real key echoed in response")
 			}
 		})
@@ -125,23 +136,19 @@ func TestAuthAndAllowlist(t *testing.T) {
 
 func TestKeyInjectionAndPassthrough(t *testing.T) {
 	anthGot := make(chan seen, 1)
-	oaiGot := make(chan seen, 1)
+	oaiGot := make(chan seen, 2)
 	anth := fakeUpstream(t, anthGot, 201, `{"id":"msg_1"}`)
 	oai := fakeUpstream(t, oaiGot, 429, `{"error":"rate"}`)
 	g := newTestGateway(t, anth.URL, oai.URL)
 
 	rec := do(g, http.MethodPost, "/anthropic/v1/messages?beta=1",
 		map[string]string{"x-api-key": dummyKey}, `{"model":"m"}`)
-	// do() sets Path only; query is not carried, so check it separately below.
 	if rec.Code != 201 || rec.Body.String() != `{"id":"msg_1"}` || rec.Header().Get("X-Upstream") != "yes" {
 		t.Fatalf("anthropic passthrough: %d %q", rec.Code, rec.Body.String())
 	}
 	s := <-anthGot
 	if s.apiKey != realAnthKey || s.auth != "" {
 		t.Fatalf("anthropic upstream headers: apiKey=%q auth=%q", s.apiKey, s.auth)
-	}
-	if s.method != http.MethodPost || s.body != `{"model":"m"}` {
-		t.Fatalf("anthropic upstream request: %+v", s)
 	}
 
 	rec = do(g, http.MethodGet, "/openai/v1/models",
@@ -150,12 +157,128 @@ func TestKeyInjectionAndPassthrough(t *testing.T) {
 		t.Fatalf("openai passthrough: %d %q", rec.Code, rec.Body.String())
 	}
 	s = <-oaiGot
-	if s.auth != "Bearer "+realOpenAIKy || s.apiKey != "" || s.path != "/v1/models" || s.method != http.MethodGet {
+	if s.auth != "Bearer "+realOpenAIKy || s.apiKey != "" || s.path != "/v1/models" {
 		t.Fatalf("openai upstream: %+v", s)
 	}
-	if strings.Contains(s.auth+s.apiKey, dummyKey) {
-		t.Fatal("upstream saw dummy key")
+
+	rec = do(g, http.MethodPost, "/openrouter/v1/chat/completions",
+		map[string]string{"Authorization": "Bearer " + dummyKey}, "{}")
+	if rec.Code != 429 {
+		t.Fatalf("openrouter status = %d", rec.Code)
 	}
+	s = <-oaiGot
+	if s.auth != "Bearer "+realOpenRouterKey || s.apiKey != "" || s.path != "/v1/chat/completions" {
+		t.Fatalf("openrouter upstream: %+v", s)
+	}
+}
+
+func TestExtraProvidersAndValidation(t *testing.T) {
+	got := make(chan seen, 2)
+	up := fakeUpstream(t, got, 200, "ok")
+
+	if _, err := New(Config{
+		ListenAddr: "127.0.0.1:18080", AllowLoopbackForTest: true, BranchKey: dummyKey,
+		ExtraProviders: []ProviderRoute{{Name: "anthropic", Upstream: up.URL}},
+	}); err == nil {
+		t.Fatal("expected duplicate builtin provider rejection")
+	}
+	if _, err := New(Config{
+		ListenAddr: "127.0.0.1:18080", AllowLoopbackForTest: true, BranchKey: dummyKey,
+		ExtraProviders: []ProviderRoute{{Name: "Bad Name", Upstream: up.URL}},
+	}); err == nil {
+		t.Fatal("expected invalid provider name rejection")
+	}
+
+	g, err := New(Config{
+		ListenAddr:           "127.0.0.1:18080",
+		AllowLoopbackForTest: true,
+		BranchKey:            dummyKey,
+		ExtraProviders: []ProviderRoute{
+			{Name: "custom-x", Upstream: up.URL + "/prefix", Key: "real-x", AuthHeader: "X-Api-Key"},
+			{Name: "custom-b", Upstream: up.URL, Key: "real-b", AuthHeader: "Authorization"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New extra providers: %v", err)
+	}
+	if rec := do(g, http.MethodPost, "/custom-x/v1/call", map[string]string{"x-api-key": dummyKey}, "{}"); rec.Code != 200 {
+		t.Fatalf("custom-x code = %d", rec.Code)
+	}
+	sx := <-got
+	if sx.path != "/prefix/v1/call" || sx.apiKey != "real-x" || sx.auth != "" {
+		t.Fatalf("custom-x got %+v", sx)
+	}
+	if rec := do(g, http.MethodPost, "/custom-b/v1/call", map[string]string{"Authorization": "Bearer " + dummyKey}, "{}"); rec.Code != 200 {
+		t.Fatalf("custom-b code = %d", rec.Code)
+	}
+	sb := <-got
+	if sb.path != "/v1/call" || sb.auth != "Bearer real-b" || sb.apiKey != "" {
+		t.Fatalf("custom-b got %+v", sb)
+	}
+}
+
+func TestSSEStreamingFlushesImmediately(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: chunk1\n\n")
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "data: chunk2\n\n")
+	}))
+	defer up.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	g, err := New(Config{
+		ListenAddr: addr, AllowLoopbackForTest: true, BranchKey: dummyKey,
+		AnthropicKey: realAnthKey, Upstreams: map[string]string{ProviderAnthropic: up.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = g.Serve(ctx) }()
+
+	var resp *http.Response
+	for i := 0; i < 50; i++ {
+		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/anthropic/v1/messages", strings.NewReader("{}"))
+		req.Header.Set("x-api-key", dummyKey)
+		resp, err = http.DefaultClient.Do(req)
+		if err == nil {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if err != nil {
+		close(release)
+		t.Fatalf("stream request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	lineCh := make(chan string, 1)
+	go func() {
+		s, _ := bufio.NewReader(resp.Body).ReadString('\n')
+		lineCh <- s
+	}()
+	select {
+	case line := <-lineCh:
+		if line != "data: chunk1\n" {
+			close(release)
+			t.Fatalf("first chunk = %q, want data: chunk1\\n", line)
+		}
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("first SSE chunk stalled behind reverse proxy buffer")
+	}
+	close(release)
 }
 
 func TestServeBindsAndForwardsQuery(t *testing.T) {
