@@ -4,12 +4,17 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"io"
+	"mime"
+	"mime/multipart"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 func git(t *testing.T, dir string, args ...string) string {
@@ -192,5 +197,119 @@ func TestApplyPatch(t *testing.T) {
 				t.Fatal("added.txt present though patch not applied")
 			}
 		})
+	}
+}
+
+func TestManifestDeltaSync(t *testing.T) {
+	dir := t.TempDir()
+	git(t, dir, "init", "-q")
+	write(t, dir, "keep.txt", "stay\n", 0o644)
+	write(t, dir, "edit.txt", "v1\n", 0o644)
+	write(t, dir, "del.txt", "bye\n", 0o644)
+	write(t, dir, "rename_src.txt", "moveme\n", 0o644)
+	write(t, dir, "mode.sh", "echo hi\n", 0o644)
+	if err := os.Symlink("keep.txt", filepath.Join(dir, "sym.txt")); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-q", "-m", "base")
+
+	sha0, golden, err := WorkspaceManifest(dir)
+	if err != nil || sha0 == "" {
+		t.Fatalf("WorkspaceManifest init = (%q, %v)", sha0, err)
+	}
+
+	write(t, dir, "edit.txt", "v2\n", 0o644)
+	write(t, dir, "added.txt", "new\n", 0o644)
+	if err := os.Remove(filepath.Join(dir, "del.txt")); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "mv", "rename_src.txt", "rename_dst.txt")
+	if err := os.Chmod(filepath.Join(dir, "mode.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(filepath.Join(dir, "sym.txt"))
+	if err := os.Symlink("edit.txt", filepath.Join(dir, "sym.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cur, err := WorkspaceManifest(dir)
+	if err != nil {
+		t.Fatalf("WorkspaceManifest cur: %v", err)
+	}
+	changed, deleted := DiffManifests(golden, cur)
+	wantChanged := []string{"added.txt", "edit.txt", "mode.sh", "rename_dst.txt", "sym.txt"}
+	wantDeleted := []string{"del.txt", "rename_src.txt"}
+	if !reflect.DeepEqual(changed, wantChanged) {
+		t.Fatalf("changed = %v, want %v", changed, wantChanged)
+	}
+	if !reflect.DeepEqual(deleted, wantDeleted) {
+		t.Fatalf("deleted = %v, want %v", deleted, wantDeleted)
+	}
+
+	// Part 2: dirty file at init reverted later + untracked file deleted + commit amend.
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-q", "-m", "clean base for part2")
+
+	write(t, dir, "keep.txt", "dirty at init\n", 0o644)
+	write(t, dir, "untracked_init.txt", "temp\n", 0o644)
+	_, dirtyGolden, err := WorkspaceManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "checkout", "--", "keep.txt")
+	if err := os.Remove(filepath.Join(dir, "untracked_init.txt")); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "commit", "--allow-empty", "--amend", "-q", "-m", "amended without touching files")
+
+	_, afterRevert, err := WorkspaceManifest(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revChanged, revDeleted := DiffManifests(dirtyGolden, afterRevert)
+	if !reflect.DeepEqual(revChanged, []string{"keep.txt"}) {
+		t.Fatalf("revert changed = %v, want [keep.txt]", revChanged)
+	}
+	if !reflect.DeepEqual(revDeleted, []string{"untracked_init.txt"}) {
+		t.Fatalf("untracked deleted = %v, want [untracked_init.txt]", revDeleted)
+	}
+}
+
+func TestEncodeSyncMultipart(t *testing.T) {
+	meta := types.SyncMeta{Mode: "delta", Delete: []string{"old.txt"}}
+	archive := []byte("fake-tgz")
+	body, ctype, err := EncodeSyncMultipart(meta, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	media, params, err := mime.ParseMediaType(ctype)
+	if err != nil || media != "multipart/form-data" {
+		t.Fatalf("ctype = %q (%v)", ctype, err)
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var gotMeta types.SyncMeta
+	var gotArchive []byte
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(p)
+		switch p.FormName() {
+		case "meta":
+			if err := json.Unmarshal(b, &gotMeta); err != nil {
+				t.Fatal(err)
+			}
+		case "archive":
+			gotArchive = b
+		}
+		_ = p.Close()
+	}
+	if !reflect.DeepEqual(gotMeta, meta) || !bytes.Equal(gotArchive, archive) {
+		t.Fatalf("roundtrip mismatch: meta=%+v archive=%q", gotMeta, gotArchive)
 	}
 }
