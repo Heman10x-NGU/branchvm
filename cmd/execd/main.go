@@ -105,7 +105,13 @@ func main() {
 	}
 	a.mountAll()
 	initLogging()
-	signal.Ignore(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	// Catch rather than ignore so execve resets child dispositions to SIG_DFL.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
+	go func() {
+		for range sigCh {
+		}
+	}()
 	go a.procs.reapLoop()
 
 	if h, _ := os.Hostname(); h == "" || h == "(none)" {
