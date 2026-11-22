@@ -191,7 +191,10 @@ func BuildFromImage(ctx context.Context, opt BuildOptions) (BuildResult, error) 
 		}, nil
 	}
 
-	staging, err := os.MkdirTemp("", "branchvm-rootfs-*")
+	if err := os.MkdirAll(opt.CacheDir, 0o755); err != nil {
+		return BuildResult{}, fmt.Errorf("create cache dir %s: %w", opt.CacheDir, err)
+	}
+	staging, err := os.MkdirTemp(opt.CacheDir, ".staging-*")
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("create staging dir: %w", err)
 	}
@@ -216,14 +219,17 @@ func BuildFromImage(ctx context.Context, opt BuildOptions) (BuildResult, error) 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return BuildResult{}, fmt.Errorf("create cache dir %s: %w", outDir, err)
 	}
-	partial := finalPath + ".partial"
-	_ = os.Remove(partial)
+	pf, err := os.CreateTemp(outDir, "rootfs.ext4.partial-*")
+	if err != nil {
+		return BuildResult{}, fmt.Errorf("create temp rootfs %s: %w", outDir, err)
+	}
+	partial := pf.Name()
+	_ = pf.Close()
+	defer os.Remove(partial)
 	if err := buildExt4FromDir(ctx, staging, partial, sizeMB, inodes, opt.Out); err != nil {
-		_ = os.Remove(partial)
 		return BuildResult{}, err
 	}
 	if err := os.Rename(partial, finalPath); err != nil {
-		_ = os.Remove(partial)
 		return BuildResult{}, fmt.Errorf("install rootfs image: %w", err)
 	}
 	return BuildResult{
@@ -264,6 +270,18 @@ func ResolveDockerfile(repoDir, dockerfile string) (string, string, error) {
 	}
 	if fi.IsDir() {
 		return "", "", fmt.Errorf("dockerfile %s is a directory", dfAbs)
+	}
+	realRepo, err := filepath.EvalSymlinks(absRepo)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve real repo dir: %w", err)
+	}
+	realDF, err := filepath.EvalSymlinks(dfAbs)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve real dockerfile: %w", err)
+	}
+	realRel, err := filepath.Rel(realRepo, realDF)
+	if err != nil || realRel == ".." || strings.HasPrefix(realRel, ".."+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("dockerfile %q resolves outside repo directory %s", dockerfile, absRepo)
 	}
 	return absRepo, dfAbs, nil
 }
@@ -704,6 +722,9 @@ func resolveInsideStaging(staging, guestPath string, followLeaf bool) (string, e
 			continue
 		}
 		cur = append(cur, seg)
+	}
+	if len(cur) == 0 {
+		return "", fmt.Errorf("guest path %q resolves to staging root", guestPath)
 	}
 	return filepath.Join(absRoot, filepath.Join(cur...)), nil
 }
