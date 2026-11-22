@@ -4,16 +4,22 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"encoding/json"
 	"mime/multipart"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
@@ -173,5 +179,95 @@ func TestMultipartSyncDeltaDeleteAndFullPreservesIgnored(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(root, "fresh.txt")); err != nil || string(b) != "new" {
 		t.Fatalf("fresh.txt = %q (%v)", b, err)
+	}
+}
+
+func TestExtractTarDirDoesNotFollowParentSymlink(t *testing.T) {
+	outside := t.TempDir()
+	root := t.TempDir()
+
+	var tarBuf bytes.Buffer
+	gz := gzip.NewWriter(&tarBuf)
+	tw := tar.NewWriter(gz)
+	_ = tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: "esc", Linkname: outside, Mode: 0o777})
+	_ = tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: "esc/pwned", Mode: 0o755})
+	_ = tw.Close()
+	_ = gz.Close()
+
+	if err := extractTarGz(bytes.NewReader(tarBuf.Bytes()), root); err != nil {
+		t.Fatalf("extractTarGz: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "pwned")); !os.IsNotExist(err) {
+		t.Fatalf("tar TypeDir escaped through parent symlink into %s/pwned", outside)
+	}
+	if fi, err := os.Stat(filepath.Join(root, "esc", "pwned")); err != nil || !fi.IsDir() {
+		t.Fatalf("expected dir inside root/esc/pwned, got err=%v", err)
+	}
+}
+
+func TestServiceDeadBlocksLateReady(t *testing.T) {
+	a := &agent{
+		svcState: map[string]bool{"worker": false},
+		svcDead:  map[string]bool{},
+	}
+	a.markServiceDead("worker")
+	a.setServiceReady("worker", true)
+	if a.servicesReady.Load() || a.svcState["worker"] {
+		t.Fatalf("dead service transitioned back to ready: ready=%t state=%+v", a.servicesReady.Load(), a.svcState)
+	}
+}
+
+func TestHandlePTYExitsWithBackgroundChild(t *testing.T) {
+	a := &agent{procs: newProcTable()}
+	srv := httptest.NewServer(http.HandlerFunc(a.handlePTY))
+	defer srv.Close()
+
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	payload, _ := json.Marshal(types.PTYRequest{
+		Cmd: []string{"sh", "-c", "sleep 30 & echo bg-ok"},
+		Dir: t.TempDir(),
+	})
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/pty", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "bvm-pty")
+	req.ContentLength = int64(len(payload))
+	if err := req.Write(conn); err != nil {
+		t.Fatal(err)
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake failed: resp=%+v err=%v", resp, err)
+	}
+
+	var out bytes.Buffer
+	for {
+		kind, data, err := types.ReadPTYFrame(br)
+		if err != nil {
+			t.Fatalf("ReadPTYFrame: %v (output so far=%q)", err, out.String())
+		}
+		if kind == types.PTYFrameData {
+			out.Write(data)
+			continue
+		}
+		if kind == types.PTYFrameExit {
+			code := int(int32(binary.BigEndian.Uint32(data)))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (out=%q)", code, out.String())
+			}
+			if !strings.Contains(out.String(), "bg-ok") {
+				t.Fatalf("output %q missing bg-ok", out.String())
+			}
+			return
+		}
 	}
 }

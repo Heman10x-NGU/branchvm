@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -153,4 +154,46 @@ func TestForwardEchoRoundtrip(t *testing.T) {
 	}
 
 	_ = sync.Mutex{} // ensure sync import clean if needed
+}
+
+func TestAttachUnexpectedEOF(t *testing.T) {
+	addr := startMockGuestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: bvm-pty\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+		_ = types.WritePTYFrame(conn, types.PTYFrameData, []byte("partial"))
+		_ = conn.Close()
+	}))
+
+	var out bytes.Buffer
+	code, err := Attach(context.Background(), addr, types.PTYRequest{Cmd: []string{"true"}}, nil, &out)
+	if code == 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("got (%d, %v), want non-zero exit with ErrUnexpectedEOF", code, err)
+	}
+	if out.String() != "partial" {
+		t.Fatalf("stdout = %q, want partial", out.String())
+	}
+}
+
+func TestAttachCancelDuringHandshake(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	addr := startMockGuestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	code, err := Attach(ctx, addr, types.PTYRequest{Cmd: []string{"true"}}, nil, io.Discard)
+	if code == 0 || err == nil {
+		t.Fatalf("got (%d, %v), want error on canceled handshake", code, err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Attach took too long on canceled handshake: %s", time.Since(start))
+	}
 }

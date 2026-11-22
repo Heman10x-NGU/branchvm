@@ -58,6 +58,13 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 	}
 	defer conn.Close()
 
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-sessionCtx.Done()
+		_ = conn.Close()
+	}()
+
 	httpReq, err := http.NewRequest(http.MethodPost, "http://"+guestAPIAddr+"/pty", bytes.NewReader(payload))
 	if err != nil {
 		return 1, fmt.Errorf("build pty request: %w", err)
@@ -80,13 +87,6 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 		_ = resp.Body.Close()
 		return 1, fmt.Errorf("pty upgrade failed (%d): %s", resp.StatusCode, bytes.TrimSpace(body))
 	}
-
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		<-sessionCtx.Done()
-		_ = conn.Close()
-	}()
 
 	var writeMu sync.Mutex
 	sendFrame := func(kind byte, data []byte) error {
@@ -126,11 +126,15 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 	}
 
 	exitCode := 0
+	gotExit := false
 	for {
 		kind, data, err := types.ReadPTYFrame(br)
 		if err != nil {
-			if errors.Is(err, io.EOF) || sessionCtx.Err() != nil {
+			if sessionCtx.Err() != nil {
 				return exitCode, nil
+			}
+			if errors.Is(err, io.EOF) && !gotExit {
+				return 1, fmt.Errorf("pty connection closed before exit: %w", io.ErrUnexpectedEOF)
 			}
 			return 1, fmt.Errorf("read pty frame: %w", err)
 		}
@@ -142,6 +146,7 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 				}
 			}
 		case types.PTYFrameExit:
+			gotExit = true
 			if len(data) == 4 {
 				exitCode = int(int32(binary.BigEndian.Uint32(data)))
 			}
