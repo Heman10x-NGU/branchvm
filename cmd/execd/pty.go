@@ -105,11 +105,21 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var writeMu sync.Mutex
+	var (
+		writeMu  sync.Mutex
+		exitSent bool
+	)
 	sendFrame := func(kind byte, payload []byte) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		return types.WritePTYFrame(conn, kind, payload)
+		if exitSent {
+			return io.ErrClosedPipe
+		}
+		err := types.WritePTYFrame(conn, kind, payload)
+		if kind == types.PTYFrameExit {
+			exitSent = true
+		}
+		return err
 	}
 
 	masterDone := make(chan struct{})
@@ -124,7 +134,7 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if err != nil {
-				if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.EIO) && !errors.Is(err, os.ErrClosed) {
+				if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.EIO) && !errors.Is(err, os.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
 					_ = sendFrame(types.PTYFrameData, []byte(fmt.Sprintf("\r\n[pty read error: %v]\r\n", err)))
 				}
 				return
@@ -186,8 +196,11 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-masterDone:
 	case <-time.After(200 * time.Millisecond):
-		_ = master.Close()
-		<-masterDone
+		_ = master.SetReadDeadline(time.Now())
+		select {
+		case <-masterDone:
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	exitCode := 0
@@ -208,7 +221,7 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 }
 
 func openPTY() (master, slave *os.File, err error) {
-	master, err = os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_CLOEXEC, 0)
+	master, err = os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open /dev/ptmx: %w", err)
 	}

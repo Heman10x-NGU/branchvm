@@ -230,8 +230,9 @@ func TestHandlePTYExitsWithBackgroundChild(t *testing.T) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
+	started := time.Now()
 	payload, _ := json.Marshal(types.PTYRequest{
-		Cmd: []string{"sh", "-c", "sleep 30 & echo bg-ok"},
+		Cmd: []string{"sh", "-c", "trap '' HUP; sleep 5 & echo bg-ok"},
 		Dir: t.TempDir(),
 	})
 	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/pty", bytes.NewReader(payload))
@@ -266,6 +267,9 @@ func TestHandlePTYExitsWithBackgroundChild(t *testing.T) {
 			}
 			if !strings.Contains(out.String(), "bg-ok") {
 				t.Fatalf("output %q missing bg-ok", out.String())
+			}
+			if elapsed := time.Since(started); elapsed > 2*time.Second {
+				t.Fatalf("handlePTY waited for background child: %s", elapsed)
 			}
 			return
 		}
