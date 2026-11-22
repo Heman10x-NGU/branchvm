@@ -1,10 +1,25 @@
-<p align="left">
-  <img src="docs/icon.svg" width="56" height="56" alt="branchvm icon">
-</p>
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/icon-dark.svg">
+    <img src="docs/icon.svg" width="80" height="80" alt="branchvm icon">
+  </picture>
 
-# branchvm
+  <h1>branchvm</h1>
 
-Free local Firecracker sandboxes for running any number of AI coding agents in parallel on the same problem. Fork your repo and live backend services into isolated microVMs on your own machine, let each agent try a different fix or implementation at the same time, inspect the diffs, and apply the winner back to your host repo.
+  <p>
+    Free local Firecracker sandboxes for running any number of AI coding agents in parallel on the same problem. Fork your repo and live backend services into isolated microVMs, test different implementations at once, and apply the winning diff back to your host.
+  </p>
+
+  <p>
+    <a href="#how-it-works">How it works</a> &middot;
+    <a href="#under-the-hood">Under the hood</a> &middot;
+    <a href="#quickstart">Quickstart</a> &middot;
+    <a href="#security-verification">Verification</a> &middot;
+    <a href="#benchmarks">Benchmarks</a>
+  </p>
+</div>
+
+<br>
 
 ## The problem
 
@@ -20,7 +35,9 @@ Standard local tools break down here:
 
 ## How it works
 
-![branchvm end-to-end architecture](docs/diagrams/00-architecture-overview.png)
+<p align="center">
+  <img src="docs/diagrams/00-architecture-overview.png" width="860" alt="branchvm end-to-end architecture">
+</p>
 
 The workflow uses three commands:
 
@@ -34,7 +51,9 @@ The workflow uses three commands:
 
 ### Shared RAM across concurrent branches
 
-![Shared RAM with Copy-on-Write](docs/diagrams/01-ram-cow-sharing.png)
+<p align="center">
+  <img src="docs/diagrams/01-ram-cow-sharing.png" width="860" alt="Shared RAM with Copy-on-Write">
+</p>
 
 If 5 or 10 agents run concurrently, why do they not each consume a full 1 GiB of host RAM?
 
@@ -44,7 +63,9 @@ Only when a branch writes to a 4 KB page (an `INSERT` or a file edit) does the k
 
 ### Instant disk clones with XFS reflink
 
-![XFS reflink Copy-on-Write disk cloning](docs/diagrams/02-xfs-reflink-disk.png)
+<p align="center">
+  <img src="docs/diagrams/02-xfs-reflink-disk.png" width="860" alt="XFS reflink Copy-on-Write disk cloning">
+</p>
 
 Copying a 1.5 GB root disk image with normal `cp` reads and writes 1.5 GB on the SSD every time. `branchvm` creates a loopback XFS filesystem with `mkfs.xfs -m reflink=1,crc=1` and clones `golden/rootfs.ext4` using `cp --reflink=always`.
 
@@ -52,7 +73,9 @@ A reflink clone finishes in ~1 ms and uses 0 extra bytes on disk. XFS writes a t
 
 ### Hardware isolation and cgroups v2
 
-![Docker shared kernel vs Firecracker microVM and cgroups v2](docs/diagrams/03-kernel-microvm-cgroup.png)
+<p align="center">
+  <img src="docs/diagrams/03-kernel-microvm-cgroup.png" width="860" alt="Docker shared kernel vs Firecracker microVM and cgroups v2">
+</p>
 
 The Linux kernel sits between physical hardware and user programs. Docker containers are host processes wrapped in namespaces, so every container sends syscalls directly to one shared host kernel. A kernel escape in one container reaches the host.
 
@@ -62,7 +85,9 @@ On the host, every Firecracker process sits inside its own `cgroups v2` director
 
 ### Network lockdown and the API gateway
 
-![nftables policy drop firewall and zero-MITM host gateway](docs/diagrams/04-firewall-gateway-lockdown.png)
+<p align="center">
+  <img src="docs/diagrams/04-firewall-gateway-lockdown.png" width="860" alt="nftables policy drop firewall and zero-MITM host gateway">
+</p>
 
 Every branch lives in its own Linux network namespace (`netns`), so every branch uses the same guest IP (`172.16.0.2`) and Postgres port (`127.0.0.1:5432`) with no port remapping.
 
