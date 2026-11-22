@@ -197,7 +197,7 @@ func (a *agent) runPostgres(svcName string) {
 		err := a.procs.wait(cmd)
 		a.pgAlive.Store(false)
 		a.pgReady.Store(false)
-		a.setServiceReady(svcName, false)
+		a.markServiceDead(svcName)
 		if err == nil {
 			err = errors.New("exit status 0")
 		}

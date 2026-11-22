@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"syscall"
@@ -132,6 +133,9 @@ func nlSendAndAck(fd int, seq *uint32, msgType, flags uint16, payload []byte) er
 	for {
 		n, _, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
 			return fmt.Errorf("recvfrom: %w", err)
 		}
 		msgs, err := syscall.ParseNetlinkMessage(buf[:n])

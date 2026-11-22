@@ -541,6 +541,9 @@ func ensureParentDir(root, parent string) error {
 }
 
 func extractEntry(r io.Reader, hdr *tar.Header, root, target string) error {
+	if err := ensureParentDir(root, filepath.Dir(target)); err != nil {
+		return fmt.Errorf("create parent: %w", err)
+	}
 	mode := hdr.FileInfo().Mode().Perm()
 	if hdr.Typeflag == tar.TypeDir {
 		if fi, err := os.Lstat(target); err == nil && !fi.IsDir() {
@@ -549,9 +552,6 @@ func extractEntry(r io.Reader, hdr *tar.Header, root, target string) error {
 			}
 		}
 		return os.MkdirAll(target, mode|0o700)
-	}
-	if err := ensureParentDir(root, filepath.Dir(target)); err != nil {
-		return fmt.Errorf("create parent: %w", err)
 	}
 	switch hdr.Typeflag {
 	case tar.TypeReg, tar.TypeSymlink, tar.TypeLink:
