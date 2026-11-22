@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XFS Reflink 1ms Disk Copy-on-Write</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Serif:ital@0;1&family=Noto+Sans+KR:wght@400;500;600&family=Noto+Serif+KR:wght@400&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f4;
+      --color-ink:     #141414;
+      --color-muted:   #525252;
+      --color-soft:    #737373;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">02 · STORAGE ARCHITECTURE · MONOCHROME</p>
+    <h1>Why XFS Reflink Clones a 1.5 GB Disk in 1 ms With Zero Extra SSD Space</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="xfs-reflink-title xfs-reflink-desc">
+        <title id="xfs-reflink-title">XFS Reflink Copy-on-Write Disk Cloning</title>
+        <desc id="xfs-reflink-desc">Architecture showing golden and cloned rootfs disk images sharing the same physical SSD blocks through XFS reflink metadata pointers and allocating new blocks only on branch writes.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#525252"/>
+          </marker>
+          <marker id="arrow-focal" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#141414"/>
+          </marker>
+          <marker id="arrow-soft" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#737373"/>
+          </marker>
+        </defs>
+
+        <!-- Clean paper background -->
+        <rect width="100%" height="100%" fill="#f5f5f4"/>
+
+        <!-- ZONES -->
+        <rect x="40" y="48" width="248" height="376" rx="8" fill="rgba(20,20,20,0.025)" stroke="rgba(20,20,20,0.14)" stroke-width="0.8"/>
+        <rect x="56" y="52" width="164" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="138" y="62" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">VIRTUAL DISK FILES</text>
+
+        <rect x="356" y="48" width="232" height="376" rx="8" fill="rgba(20,20,20,0.025)" stroke="rgba(20,20,20,0.14)" stroke-width="0.8"/>
+        <rect x="372" y="52" width="164" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="454" y="62" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">XFS METADATA LAYER</text>
+
+        <rect x="656" y="48" width="264" height="376" rx="8" fill="rgba(20,20,20,0.025)" stroke="rgba(20,20,20,0.14)" stroke-width="0.8"/>
+        <rect x="672" y="52" width="160" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="752" y="62" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">PHYSICAL SSD BLOCKS</text>
+
+        <!-- CONNECTORS (drawn before nodes, zero crossings) -->
+        <!-- Golden -> XFS Map (port y=132 -> elbow at x=320 -> port y=184) -->
+        <path d="M 268,132 H 312 Q 320,132 320,140 V 176 Q 320,184 328,184 H 376" fill="none" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <!-- Branch 1 -> XFS Map (straight horizontal at y=244) -->
+        <line x1="268" y1="244" x2="376" y2="244" stroke="#141414" stroke-width="1.6" marker-end="url(#arrow-focal)"/>
+        <rect x="280" y="220" width="84" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="322" y="230" fill="#141414" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PTR ONLY 1MS</text>
+
+        <!-- Branch 2 -> XFS Map (port y=360 -> elbow at x=320 -> port y=304) -->
+        <path d="M 268,360 H 312 Q 320,360 320,352 V 312 Q 320,304 328,304 H 376" fill="none" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <!-- XFS Map -> Shared SSD Blocks (port y=184 -> elbow at x=620 -> y=140) -->
+        <path d="M 568,184 H 612 Q 620,184 620,176 V 148 Q 620,140 628,140 H 676" fill="none" stroke="#141414" stroke-width="1.6" marker-end="url(#arrow-focal)"/>
+        <rect x="576" y="116" width="88" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="620" y="126" fill="#141414" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ALL READ SAME</text>
+
+        <!-- XFS Map -> Branch 1 New Block (dashed, straight horizontal at y=256) -->
+        <line x1="568" y1="256" x2="676" y2="256" stroke="#737373" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-soft)"/>
+        <rect x="580" y="232" width="84" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="622" y="242" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NEW ON WRITE</text>
+
+        <!-- XFS Map -> Branch 2 New Block (dashed, port y=304 -> elbow at x=620 -> y=360) -->
+        <path d="M 568,304 H 612 Q 620,304 620,312 V 352 Q 620,360 628,360 H 676" fill="none" stroke="#737373" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-soft)"/>
+
+        <!-- NODES -->
+        <!-- 1. Golden Disk -->
+        <rect x="60" y="88" width="208" height="88" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="88" width="208" height="88" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1"/>
+        <rect x="72" y="98" width="68" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="106" y="108" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BASE DISK</text>
+        <text x="164" y="134" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">golden/rootfs.ext4</text>
+        <text x="164" y="156" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1.5 GB OS + PG16 + repo</text>
+
+        <!-- 2. Branch 1 Clone -->
+        <rect x="60" y="200" width="208" height="88" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="200" width="208" height="88" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1"/>
+        <rect x="72" y="210" width="76" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="110" y="220" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">1 MS CLONE</text>
+        <text x="164" y="246" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Branch 1 Disk</text>
+        <text x="164" y="268" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">cp --reflink=always (+0 B)</text>
+
+        <!-- 3. Branch 2 Clone -->
+        <rect x="60" y="316" width="208" height="88" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="316" width="208" height="88" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1"/>
+        <rect x="72" y="326" width="76" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="110" y="336" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">1 MS CLONE</text>
+        <text x="164" y="362" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Branch 2 Disk</text>
+        <text x="164" y="384" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">cp --reflink=always (+0 B)</text>
+
+        <!-- 4. XFS Reflink Map (FOCAL) -->
+        <rect x="376" y="148" width="192" height="188" rx="6" fill="#f5f5f4"/>
+        <rect x="376" y="148" width="192" height="188" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1.8"/>
+        <rect x="388" y="158" width="88" height="14" rx="2" fill="#141414"/>
+        <text x="432" y="168" fill="#ffffff" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">XFS REFLINK=1</text>
+        <text x="472" y="200" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Block Pointer Table</text>
+        <text x="472" y="226" fill="#141414" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">clones metadata only</text>
+        <text x="472" y="246" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">0 bytes copied at fork</text>
+        <line x1="396" y1="264" x2="548" y2="264" stroke="rgba(20,20,20,0.12)" stroke-width="0.8"/>
+        <text x="472" y="286" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">on write: splits only</text>
+        <text x="472" y="304" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">the modified 4 KB block</text>
+
+        <!-- 5. Shared SSD Blocks (FOCAL) -->
+        <rect x="676" y="88" width="224" height="104" rx="6" fill="#f5f5f4"/>
+        <rect x="676" y="88" width="224" height="104" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1.8"/>
+        <rect x="688" y="98" width="76" height="14" rx="2" fill="#141414"/>
+        <text x="726" y="108" fill="#ffffff" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STORED ONCE</text>
+        <text x="788" y="134" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Shared SSD Blocks</text>
+        <text x="788" y="154" fill="#141414" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">[B0] [B1] [B2] [B3] ...</text>
+        <text x="788" y="172" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1.5 GB total on NVMe</text>
+
+        <!-- 6. Branch 1 Delta Block -->
+        <rect x="676" y="216" width="224" height="84" rx="6" fill="#f5f5f4"/>
+        <rect x="676" y="216" width="224" height="84" rx="6" fill="rgba(20,20,20,0.04)" stroke="#525252" stroke-width="1" stroke-dasharray="4,3"/>
+        <rect x="688" y="226" width="84" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="730" y="236" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BRANCH 1 ONLY</text>
+        <text x="788" y="262" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">New Block [B2']</text>
+        <text x="788" y="282" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">edited store.go + DB row</text>
+
+        <!-- 7. Branch 2 Delta Block -->
+        <rect x="676" y="320" width="224" height="84" rx="6" fill="#f5f5f4"/>
+        <rect x="676" y="320" width="224" height="84" rx="6" fill="rgba(20,20,20,0.04)" stroke="#525252" stroke-width="1" stroke-dasharray="4,3"/>
+        <rect x="688" y="330" width="84" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="730" y="340" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">BRANCH 2 ONLY</text>
+        <text x="788" y="366" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">New Block [B3']</text>
+        <text x="788" y="386" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">SQL migration + DB row</text>
+
+        <!-- LEGEND STRIP -->
+        <line x1="40" y1="452" x2="920" y2="452" stroke="rgba(20,20,20,0.12)" stroke-width="0.8"/>
+        <text x="40" y="476" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="128" y="466" width="14" height="14" rx="2" fill="#ffffff" stroke="#141414" stroke-width="1.8"/>
+        <text x="150" y="477" fill="#141414" font-size="9" font-family="'Geist Mono', monospace">Shared base blocks + map</text>
+
+        <rect x="348" y="466" width="14" height="14" rx="2" fill="rgba(20,20,20,0.04)" stroke="#525252" stroke-width="1" stroke-dasharray="3,2"/>
+        <text x="370" y="477" fill="#525252" font-size="9" font-family="'Geist Mono', monospace">Private CoW block (allocated on write)</text>
+
+        <line x1="652" y1="473" x2="680" y2="473" stroke="#141414" stroke-width="1.6" marker-end="url(#arrow-focal)"/>
+        <text x="690" y="477" fill="#141414" font-size="9" font-family="'Geist Mono', monospace">Zero-copy reflink pointer</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>

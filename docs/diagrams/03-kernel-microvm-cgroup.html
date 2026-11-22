@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Docker Containers vs Firecracker MicroVMs and Cgroups v2</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Serif:ital@0;1&family=Noto+Sans+KR:wght@400;500;600&family=Noto+Serif+KR:wght@400&family=Noto+Sans+TC:wght@400;500;600&family=Noto+Serif+TC:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f4;
+      --color-ink:     #141414;
+      --color-muted:   #525252;
+      --color-soft:    #737373;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">03 · ISOLATION LAYER STACK · MONOCHROME</p>
+    <h1>Docker Shared Kernel vs. Firecracker MicroVM Hardware Wall and Cgroups v2</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="kernel-cgroup-title kernel-cgroup-desc">
+        <title id="kernel-cgroup-title">Docker Shared Kernel vs Firecracker MicroVM and Cgroups v2</title>
+        <desc id="kernel-cgroup-desc">Side-by-side layer stack comparing Docker containers sharing one host Linux kernel against branchvm Firecracker microVMs running separate guest kernels behind KVM hardware isolation and cgroups v2 resource caps.</desc>
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#525252"/>
+          </marker>
+          <marker id="arrow-focal" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#141414"/>
+          </marker>
+        </defs>
+
+        <!-- Clean paper background -->
+        <rect width="100%" height="100%" fill="#f5f5f4"/>
+
+        <!-- LEFT ZONE: DOCKER -->
+        <rect x="40" y="44" width="408" height="416" rx="8" fill="rgba(20,20,20,0.02)" stroke="rgba(20,20,20,0.14)" stroke-width="0.8"/>
+        <rect x="56" y="48" width="224" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="168" y="58" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">DOCKER · SHARED HOST KERNEL</text>
+
+        <!-- RIGHT ZONE: BRANCHVM -->
+        <rect x="512" y="44" width="408" height="416" rx="8" fill="rgba(20,20,20,0.02)" stroke="rgba(20,20,20,0.14)" stroke-width="0.8"/>
+        <rect x="528" y="48" width="256" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="656" y="58" fill="#141414" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.14em">BRANCHVM · HARDWARE ISOLATION</text>
+
+        <!-- Center divider -->
+        <line x1="480" y1="44" x2="480" y2="460" stroke="rgba(20,20,20,0.16)" stroke-width="0.8" stroke-dasharray="4,4"/>
+
+        <!-- CGROUPS V2 CAGE (nested inside Right Zone, drawn before inner nodes) -->
+        <rect x="532" y="76" width="368" height="144" rx="8" fill="rgba(20,20,20,0.045)" stroke="#141414" stroke-width="1.4" stroke-dasharray="5,3"/>
+        <rect x="544" y="80" width="112" height="14" rx="2" fill="#141414"/>
+        <text x="600" y="90" fill="#ffffff" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.10em">CGROUPS V2 CAGE</text>
+        <text x="776" y="90" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">memory.max · cpu.max · pids.max</text>
+
+        <!-- CONNECTORS (drawn before boxes) -->
+        <!-- Left side: Containers -> Shared Kernel -->
+        <line x1="148" y1="196" x2="148" y2="236" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <line x1="340" y1="196" x2="340" y2="236" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <rect x="192" y="208" width="104" height="14" rx="2" fill="#f5f5f4"/>
+        <text x="244" y="218" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">DIRECT SYSCALLS</text>
+        <!-- Left side: Shared Kernel -> Hardware -->
+        <line x1="244" y1="336" x2="244" y2="376" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <!-- Right side: MicroVMs -> KVM Hardware Wall -->
+        <line x1="628" y1="208" x2="628" y2="244" stroke="#141414" stroke-width="1.4" marker-end="url(#arrow-focal)"/>
+        <line x1="804" y1="208" x2="804" y2="244" stroke="#141414" stroke-width="1.4" marker-end="url(#arrow-focal)"/>
+        <!-- KVM -> Host Kernel -> Hardware -->
+        <line x1="716" y1="308" x2="716" y2="328" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <line x1="716" y1="376" x2="716" y2="392" stroke="#525252" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <!-- LEFT NODES (DOCKER) -->
+        <!-- Container 1 -->
+        <rect x="60" y="100" width="176" height="96" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="100" width="176" height="96" rx="6" fill="#ffffff" stroke="#525252" stroke-width="1"/>
+        <rect x="72" y="110" width="68" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.30)" stroke-width="0.8"/>
+        <text x="106" y="120" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PROCESS 1</text>
+        <text x="148" y="148" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Container 1</text>
+        <text x="148" y="168" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">App + Agent A</text>
+        <text x="148" y="184" fill="#737373" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no own kernel</text>
+
+        <!-- Container 2 -->
+        <rect x="252" y="100" width="176" height="96" rx="6" fill="#f5f5f4"/>
+        <rect x="252" y="100" width="176" height="96" rx="6" fill="#ffffff" stroke="#525252" stroke-width="1"/>
+        <rect x="264" y="110" width="68" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.30)" stroke-width="0.8"/>
+        <text x="298" y="120" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PROCESS 2</text>
+        <text x="340" y="148" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Container 2</text>
+        <text x="340" y="168" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">App + Agent B</text>
+        <text x="340" y="184" fill="#737373" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">no own kernel</text>
+
+        <!-- Shared Host Linux Kernel -->
+        <rect x="60" y="236" width="368" height="100" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="236" width="368" height="100" rx="6" fill="rgba(20,20,20,0.04)" stroke="#525252" stroke-width="1.2" stroke-dasharray="4,3"/>
+        <rect x="72" y="246" width="128" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.35)" stroke-width="0.8"/>
+        <text x="136" y="256" fill="#525252" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SINGLE ATTACK SURFACE</text>
+        <text x="244" y="284" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">ONE Shared Host Linux Kernel</text>
+        <text x="244" y="304" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">sits between hardware and all user apps</text>
+        <text x="244" y="322" fill="#737373" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1 kernel bug = container escapes to host</text>
+
+        <!-- Left Physical Hardware -->
+        <rect x="60" y="376" width="368" height="64" rx="6" fill="#f5f5f4"/>
+        <rect x="60" y="376" width="368" height="64" rx="6" fill="rgba(20,20,20,0.06)" stroke="#525252" stroke-width="1"/>
+        <text x="244" y="404" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Physical Hardware</text>
+        <text x="244" y="424" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">CPU · RAM · NVMe SSD · Network Card</text>
+
+        <!-- RIGHT NODES (BRANCHVM) -->
+        <!-- MicroVM 1 -->
+        <rect x="548" y="108" width="160" height="100" rx="6" fill="#f5f5f4"/>
+        <rect x="548" y="108" width="160" height="100" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1.2"/>
+        <rect x="560" y="118" width="60" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.40)" stroke-width="0.8"/>
+        <text x="590" y="128" fill="#141414" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MICROVM 1</text>
+        <text x="628" y="154" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Branch 1</text>
+        <text x="628" y="174" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Agent A + PG :5432</text>
+        <text x="628" y="192" fill="#141414" font-size="9" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="middle">Own Guest Kernel</text>
+
+        <!-- MicroVM 2 -->
+        <rect x="724" y="108" width="160" height="100" rx="6" fill="#f5f5f4"/>
+        <rect x="724" y="108" width="160" height="100" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1.2"/>
+        <rect x="736" y="118" width="60" height="14" rx="2" fill="none" stroke="rgba(20,20,20,0.40)" stroke-width="0.8"/>
+        <text x="766" y="128" fill="#141414" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">MICROVM 2</text>
+        <text x="804" y="154" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Branch 2</text>
+        <text x="804" y="174" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Agent B + PG :5432</text>
+        <text x="804" y="192" fill="#141414" font-size="9" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="middle">Own Guest Kernel</text>
+
+        <!-- KVM Hardware Wall (FOCAL) -->
+        <rect x="532" y="244" width="368" height="64" rx="6" fill="#f5f5f4"/>
+        <rect x="532" y="244" width="368" height="64" rx="6" fill="#ffffff" stroke="#141414" stroke-width="1.8"/>
+        <rect x="544" y="254" width="84" height="14" rx="2" fill="#141414"/>
+        <text x="586" y="264" fill="#ffffff" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HARDWARE WALL</text>
+        <text x="748" y="274" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Firecracker + KVM (/dev/kvm)</text>
+        <text x="716" y="294" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">CPU hardware boundary · no BIOS/USB/GPU bloat</text>
+
+        <!-- Host Linux Kernel -->
+        <rect x="532" y="328" width="368" height="48" rx="6" fill="#f5f5f4"/>
+        <rect x="532" y="328" width="368" height="48" rx="6" fill="#ffffff" stroke="#525252" stroke-width="1"/>
+        <text x="716" y="350" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Host Linux Kernel</text>
+        <text x="716" y="366" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">enforces KVM boundary + cgroups v2 caps</text>
+
+        <!-- Right Physical Hardware -->
+        <rect x="532" y="392" width="368" height="48" rx="6" fill="#f5f5f4"/>
+        <rect x="532" y="392" width="368" height="48" rx="6" fill="rgba(20,20,20,0.06)" stroke="#525252" stroke-width="1"/>
+        <text x="716" y="414" fill="#141414" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Physical Hardware</text>
+        <text x="716" y="430" fill="#525252" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">CPU hardware virtualization · RAM · NVMe SSD</text>
+
+        <!-- LEGEND STRIP -->
+        <line x1="40" y1="492" x2="920" y2="492" stroke="rgba(20,20,20,0.12)" stroke-width="0.8"/>
+        <text x="40" y="516" fill="#525252" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+        <rect x="128" y="506" width="14" height="14" rx="2" fill="#ffffff" stroke="#141414" stroke-width="1.8"/>
+        <text x="150" y="517" fill="#141414" font-size="9" font-family="'Geist Mono', monospace">KVM hardware boundary</text>
+
+        <rect x="336" y="506" width="14" height="14" rx="2" fill="rgba(20,20,20,0.045)" stroke="#141414" stroke-width="1.4" stroke-dasharray="4,2"/>
+        <text x="358" y="517" fill="#141414" font-size="9" font-family="'Geist Mono', monospace">cgroups v2 resource cap (RAM/CPU/PIDs)</text>
+
+        <rect x="644" y="506" width="14" height="14" rx="2" fill="rgba(20,20,20,0.04)" stroke="#525252" stroke-width="1" stroke-dasharray="3,2"/>
+        <text x="666" y="517" fill="#525252" font-size="9" font-family="'Geist Mono', monospace">Shared kernel attack surface</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
