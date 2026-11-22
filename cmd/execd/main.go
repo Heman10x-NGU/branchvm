@@ -1,14 +1,16 @@
 //go:build linux
 
 // Command execd is PID 1 inside a branchvm guest: it mounts the kernel
-// filesystems, configures the network, supervises Postgres, reaps orphans,
-// and serves the host control API.
+// filesystems, configures the network, supervises configured services,
+// reaps orphans, and serves the host control API.
 package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -21,6 +23,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 const (
@@ -29,7 +33,10 @@ const (
 	gatewayAddr       = "172.16.0.1"
 	listenAddr        = guestAddr + ":8080"
 	guestHostname     = "branchvm"
-	basePATH          = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	defaultPATH       = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	basePATH          = "PATH=" + defaultPATH
+	imageEnvPath      = "/etc/branchvm/image-env.json"
+	servicesSpecPath  = "/etc/branchvm/services.json"
 	retryDelay        = time.Second
 	readHeaderTimeout = 10 * time.Second
 )
@@ -55,22 +62,41 @@ var mounts = []mountSpec{
 var logOut = os.Stdout
 
 type agent struct {
-	start    time.Time
-	procs    *procTable
-	degraded atomic.Bool
-	pgAlive  atomic.Bool
-	pgReady  atomic.Bool
+	start         time.Time
+	procs         *procTable
+	degraded      atomic.Bool
+	pgAlive       atomic.Bool
+	pgReady       atomic.Bool
+	servicesReady atomic.Bool
 
-	credMu sync.Mutex
-	pgCred *syscall.Credential
+	imageEnv []string
+	services []types.ServiceSpec
+
+	svcMu    sync.Mutex
+	svcState map[string]bool
+
+	credMu     sync.Mutex
+	pgCred     *syscall.Credential
+	pgBinDir   string
+	pgDataDir  string
+	pgConfFile string
 
 	wsMu    sync.Mutex
 	baseSHA string
 }
 
 func main() {
-	a := &agent{start: time.Now(), procs: newProcTable()}
-	_ = os.Setenv("PATH", strings.TrimPrefix(basePATH, "PATH="))
+	a := &agent{
+		start:    time.Now(),
+		procs:    newProcTable(),
+		svcState: map[string]bool{},
+	}
+	a.imageEnv = loadImageEnv(imageEnvPath)
+	a.services = loadServiceSpecs(servicesSpecPath, func(err error) {
+		a.fail("services-config", err)
+	})
+
+	_ = os.Setenv("PATH", mergePATH(extractPATH(a.imageEnv), defaultPATH))
 
 	if err := syscall.Mount("", "/", "", syscall.MS_REMOUNT, ""); err != nil {
 		log.Printf("execd: remount / rw: %v", err)
@@ -88,7 +114,7 @@ func main() {
 	if err := a.setupNetwork(); err != nil {
 		a.fail("network", err)
 	}
-	go a.runPostgres()
+	go a.runServices()
 	a.serve()
 }
 
@@ -122,23 +148,81 @@ func baseEnv() []string {
 	return []string{basePATH, "HOME=/root", "LANG=C.UTF-8"}
 }
 
-func (a *agent) setupNetwork() error {
-	steps := [][]string{
-		{"link", "set", "lo", "up"},
-		{"link", "set", "eth0", "up"},
-		{"addr", "replace", guestCIDR, "dev", "eth0"},
-		{"route", "replace", "default", "via", gatewayAddr},
+func loadImageEnv(path string) []string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("execd: read %s: %v", path, err)
+		}
+		return nil
 	}
-	for _, args := range steps {
-		cmd := exec.Command("ip", args...)
-		cmd.Env = baseEnv()
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := a.procs.run(cmd); err != nil {
-			return fmt.Errorf("ip %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	var env []string
+	if err := json.Unmarshal(raw, &env); err != nil {
+		log.Printf("execd: parse %s: %v", path, err)
+		return nil
+	}
+	return env
+}
+
+func (a *agent) mergeEnv(extra ...[]string) []string {
+	layers := make([][]string, 0, 2+len(extra))
+	layers = append(layers, baseEnv(), a.imageEnv)
+	layers = append(layers, extra...)
+	return mergeEnv(layers...)
+}
+
+// mergeEnv merges KEY=VALUE layers so later layers override earlier ones while
+// preserving standard system directories inside PATH.
+func mergeEnv(layers ...[]string) []string {
+	order := []string{}
+	vals := map[string]string{}
+	for _, layer := range layers {
+		for _, item := range layer {
+			k, v, ok := strings.Cut(item, "=")
+			if !ok || k == "" {
+				continue
+			}
+			if k == "PATH" {
+				v = mergePATH(v, vals[k])
+			}
+			if _, exists := vals[k]; !exists {
+				order = append(order, k)
+			}
+			vals[k] = v
 		}
 	}
-	return nil
+	out := make([]string, 0, len(order))
+	for _, k := range order {
+		out = append(out, k+"="+vals[k])
+	}
+	return out
+}
+
+func extractPATH(env []string) string {
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "PATH="); ok {
+			return v
+		}
+	}
+	return ""
+}
+
+func mergePATH(primary, fallback string) string {
+	seen := map[string]bool{}
+	var parts []string
+	add := func(raw string) {
+		for _, p := range strings.Split(raw, ":") {
+			if p == "" || seen[p] {
+				continue
+			}
+			seen[p] = true
+			parts = append(parts, p)
+		}
+	}
+	add(primary)
+	add(fallback)
+	add(defaultPATH)
+	return strings.Join(parts, ":")
 }
 
 func (a *agent) serve() {
