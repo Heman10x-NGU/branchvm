@@ -6,13 +6,20 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 // gitOutput runs git in repoDir and returns stdout, wrapping stderr on error.
@@ -61,6 +68,149 @@ func parsePorcelainZ(out []byte) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+// WorkspaceManifest computes the current HEAD SHA and a deterministic content
+// signature map for all tracked and untracked non-ignored files in repoDir.
+func WorkspaceManifest(repoDir string) (string, map[string]string, error) {
+	var hostSHA string
+	if out, err := gitOutput(repoDir, "rev-parse", "HEAD"); err == nil {
+		hostSHA = strings.TrimSpace(string(out))
+	}
+
+	idxOut, err := gitOutput(repoDir, "ls-files", "-s", "-z")
+	if err != nil {
+		return "", nil, err
+	}
+	files := map[string]string{}
+	for _, rec := range strings.Split(string(idxOut), "\x00") {
+		if rec == "" {
+			continue
+		}
+		meta, path, ok := strings.Cut(rec, "\t")
+		if !ok || path == "" {
+			continue
+		}
+		parts := strings.Fields(meta)
+		if len(parts) < 2 || parts[0] == "160000" {
+			continue
+		}
+		files[path] = "git:" + parts[1] + ":" + parts[0]
+	}
+
+	stOut, err := gitOutput(repoDir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return "", nil, err
+	}
+	recs := strings.Split(string(stOut), "\x00")
+	for i := 0; i < len(recs); i++ {
+		r := recs[i]
+		if len(r) < 4 {
+			continue
+		}
+		x, y, path := r[0], r[1], r[3:]
+		if x == 'R' || x == 'C' {
+			if i+1 < len(recs) {
+				if x == 'R' {
+					delete(files, recs[i+1])
+				}
+				i++
+			}
+		}
+		if x == '!' {
+			continue
+		}
+		if x == 'D' || y == 'D' {
+			delete(files, path)
+			continue
+		}
+		sig, present, err := diskEntrySignature(repoDir, path)
+		if err != nil {
+			return "", nil, err
+		}
+		if !present {
+			delete(files, path)
+			continue
+		}
+		files[path] = sig
+	}
+	return hostSHA, files, nil
+}
+
+func diskEntrySignature(repoDir, rel string) (string, bool, error) {
+	full := filepath.Join(repoDir, filepath.FromSlash(rel))
+	info, err := os.Lstat(full)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lstat %s: %w", rel, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(full)
+		if err != nil {
+			return "", false, fmt.Errorf("readlink %s: %w", rel, err)
+		}
+		return "link:" + target, true, nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", false, nil
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		return "", false, fmt.Errorf("open %s: %w", rel, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", false, fmt.Errorf("hash %s: %w", rel, err)
+	}
+	return fmt.Sprintf("sha:%s:%04o", hex.EncodeToString(h.Sum(nil)), info.Mode().Perm()), true, nil
+}
+
+// DiffManifests returns sorted paths that were added/modified and paths that
+// were deleted between golden and current manifests.
+func DiffManifests(golden, current map[string]string) (changed []string, deleted []string) {
+	for path, curSig := range current {
+		if golden[path] != curSig {
+			changed = append(changed, path)
+		}
+	}
+	for path := range golden {
+		if _, ok := current[path]; !ok {
+			deleted = append(deleted, path)
+		}
+	}
+	sort.Strings(changed)
+	sort.Strings(deleted)
+	return changed, deleted
+}
+
+// EncodeSyncMultipart serializes sync metadata and an optional gzip tar archive
+// as a multipart/form-data request body.
+func EncodeSyncMultipart(meta types.SyncMeta, archive []byte) (body []byte, contentType string, err error) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	mp, err := mw.CreateFormField("meta")
+	if err != nil {
+		return nil, "", fmt.Errorf("create meta field: %w", err)
+	}
+	if err := json.NewEncoder(mp).Encode(meta); err != nil {
+		return nil, "", fmt.Errorf("encode sync meta: %w", err)
+	}
+	if len(archive) > 0 {
+		ap, err := mw.CreateFormFile("archive", "workspace.tar.gz")
+		if err != nil {
+			return nil, "", fmt.Errorf("create archive field: %w", err)
+		}
+		if _, err := ap.Write(archive); err != nil {
+			return nil, "", fmt.Errorf("write archive field: %w", err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", fmt.Errorf("close multipart writer: %w", err)
+	}
+	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
 // PackWorkspace returns a gzip tar of all tracked files plus dirty and
