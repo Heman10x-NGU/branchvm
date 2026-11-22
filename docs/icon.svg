@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-labelledby="branchvm-icon-title branchvm-icon-desc">
+  <title id="branchvm-icon-title">branchvm icon</title>
+  <desc id="branchvm-icon-desc">Monochrome geometric mark showing one golden base snapshot node forking orthogonally into three isolated microVM boxes.</desc>
+  <!-- Rounded monochrome badge (crisp border works on both dark and light GitHub themes) -->
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="#141414" stroke="#3a3a3a" stroke-width="2"/>
+
+  <!-- Subtle inner isolation frame -->
+  <rect x="14" y="14" width="100" height="100" rx="16" fill="none" stroke="rgba(245,245,244,0.14)" stroke-width="1.2"/>
+
+  <!-- Orthogonal branch paths from golden base node to 3 isolated microVM nodes -->
+  <!-- Center trunk -->
+  <line x1="64" y1="84" x2="64" y2="52" stroke="#f5f5f4" stroke-width="4" stroke-linecap="square"/>
+  <!-- Left branch elbow -->
+  <path d="M 64,68 H 40 Q 34,68 34,62 V 52" fill="none" stroke="#f5f5f4" stroke-width="4" stroke-linecap="square"/>
+  <!-- Right branch elbow -->
+  <path d="M 64,68 H 88 Q 94,68 94,62 V 52" fill="none" stroke="#f5f5f4" stroke-width="4" stroke-linecap="square"/>
+
+  <!-- Top 3 isolated microVM boxes (hollow crisp frames with center core dots) -->
+  <rect x="24" y="28" width="20" height="20" rx="4" fill="#141414" stroke="#f5f5f4" stroke-width="3.5"/>
+  <rect x="54" y="28" width="20" height="20" rx="4" fill="#141414" stroke="#f5f5f4" stroke-width="3.5"/>
+  <rect x="84" y="28" width="20" height="20" rx="4" fill="#141414" stroke="#f5f5f4" stroke-width="3.5"/>
+
+  <!-- Center branch highlighted as active/winning microVM -->
+  <rect x="61" y="35" width="6" height="6" rx="1" fill="#f5f5f4"/>
+
+  <!-- Bottom golden snapshot base node (solid block) -->
+  <rect x="48" y="84" width="32" height="18" rx="4" fill="#f5f5f4"/>
+  <!-- Subtle horizontal split line inside base representing RAM + Disk snapshot -->
+  <line x1="54" y1="93" x2="74" y2="93" stroke="#141414" stroke-width="2" stroke-linecap="round"/>
+</svg>

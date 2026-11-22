@@ -1,10 +1,14 @@
+<p align="left">
+  <img src="docs/icon.svg" width="56" height="56" alt="branchvm icon">
+</p>
+
 # branchvm
 
-Run 3 to 5 coding agents in parallel against a full backend stack on one Linux machine, without port clashes, shared database corruption, or real API keys inside the sandbox.
+Free local Firecracker sandboxes for running any number of AI coding agents in parallel on the same problem. Fork your repo and live backend services into isolated microVMs on your own machine, let each agent try a different fix or implementation at the same time, inspect the diffs, and apply the winner back to your host repo.
 
 ## The problem
 
-Suppose you have a backend repo connected to Postgres (or other local services) and a bug like a signup race condition or a broken migration. You want several AI coding agents to try different fixes at the same time and keep whichever patch passes the tests.
+When you hit a hard backend bug (a race condition, a broken migration, a tricky refactor), running one agent at a time is slow. You want to spin up multiple agents in parallel, let each one test a different approach against your real database and local services, and keep whichever patch passes the tests.
 
 Standard local tools break down here:
 
