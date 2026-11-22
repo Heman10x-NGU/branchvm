@@ -96,15 +96,39 @@ func (a *agent) runServices() {
 
 func (a *agent) setServiceReady(name string, ready bool) {
 	a.svcMu.Lock()
+	defer a.svcMu.Unlock()
+	if a.svcState == nil {
+		a.svcState = map[string]bool{}
+	}
+	if ready && a.svcDead[name] {
+		return
+	}
 	a.svcState[name] = ready
-	all := true
+	a.recomputeServicesReadyLocked()
+}
+
+func (a *agent) markServiceDead(name string) {
+	a.svcMu.Lock()
+	defer a.svcMu.Unlock()
+	if a.svcDead == nil {
+		a.svcDead = map[string]bool{}
+	}
+	if a.svcState == nil {
+		a.svcState = map[string]bool{}
+	}
+	a.svcDead[name] = true
+	a.svcState[name] = false
+	a.recomputeServicesReadyLocked()
+}
+
+func (a *agent) recomputeServicesReadyLocked() {
+	all := len(a.svcState) > 0
 	for _, ok := range a.svcState {
 		if !ok {
 			all = false
 			break
 		}
 	}
-	a.svcMu.Unlock()
 	a.servicesReady.Store(all)
 }
 
@@ -164,7 +188,7 @@ func (a *agent) runCustomService(svc types.ServiceSpec) {
 	go func() {
 		err := a.procs.wait(cmd)
 		close(alive)
-		a.setServiceReady(svc.Name, false)
+		a.markServiceDead(svc.Name)
 		if err == nil {
 			err = errors.New("exit status 0")
 		}
