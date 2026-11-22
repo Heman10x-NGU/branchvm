@@ -5,6 +5,8 @@ package pool
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,5 +104,30 @@ index 1111111..2222222 100644
 	got := out.String()
 	if !strings.Contains(got, "store.go") || !strings.Contains(got, "1 file changed") {
 		t.Fatalf("writeDiffStat() output = %q, expected store.go and 1 file changed", got)
+	}
+}
+
+func TestClearGoldenSnapshotFiles(t *testing.T) {
+	dir := t.TempDir()
+	stale := []string{"snapshot", "mem", "ws.bin", "meta.json"}
+	for _, name := range stale {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keep := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := clearGoldenSnapshotFiles(dir); err != nil {
+		t.Fatalf("clearGoldenSnapshotFiles() error: %v", err)
+	}
+	for _, name := range stale {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after clearGoldenSnapshotFiles: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated file removed: %v", err)
 	}
 }

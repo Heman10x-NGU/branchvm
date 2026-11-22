@@ -164,12 +164,20 @@ func Init(ctx context.Context, opt InitOptions) error {
 		opt.Services = []types.ServiceSpec{}
 	}
 
+	mode := ""
+	if opt.Image != "" || opt.Dockerfile != "" {
+		mode = "oci"
+	}
+	if err := checkPrereqs(mode); err != nil {
+		return err
+	}
+	if err := prepareHost(opt.Out); err != nil {
+		return err
+	}
+
 	sourceRootfs := BaseRootfs
 	var imageDigest string
-	if opt.Image != "" || opt.Dockerfile != "" {
-		if err := checkPrereqs("oci"); err != nil {
-			return err
-		}
+	if mode == "oci" {
 		res, err := rootfs.BuildFromImage(ctx, rootfs.BuildOptions{
 			Image:        opt.Image,
 			Dockerfile:   opt.Dockerfile,
@@ -184,14 +192,6 @@ func Init(ctx context.Context, opt InitOptions) error {
 		}
 		sourceRootfs = res.RootfsPath
 		imageDigest = res.ImageDigest
-	} else {
-		if err := checkPrereqs(""); err != nil {
-			return err
-		}
-	}
-
-	if err := prepareHost(opt.Out); err != nil {
-		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -280,9 +280,22 @@ func refuseLiveRuns() error {
 	return nil
 }
 
+func clearGoldenSnapshotFiles(dir string) error {
+	for _, name := range []string{"snapshot", "mem", "ws.bin", "meta.json"} {
+		p := filepath.Join(dir, name)
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale golden artifact %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
 func prepareGoldenDisk(sourceRootfs string, out io.Writer) error {
 	if err := os.MkdirAll(GoldenDir, 0o755); err != nil {
 		return fmt.Errorf("create golden dir: %w", err)
+	}
+	if err := clearGoldenSnapshotFiles(GoldenDir); err != nil {
+		return err
 	}
 	dst := goldenRootfs()
 	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
