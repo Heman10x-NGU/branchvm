@@ -35,17 +35,48 @@ func gitOutput(repoDir string, args ...string) ([]byte, error) {
 	return stdout.Bytes(), nil
 }
 
+func repoLocation(repoDir string) (top, prefix string, err error) {
+	out, err := gitOutput(repoDir, "rev-parse", "--show-toplevel", "--show-prefix")
+	if err != nil {
+		return "", "", err
+	}
+	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		return repoDir, "", nil
+	}
+	top = lines[0]
+	if len(lines) > 1 {
+		prefix = lines[1]
+	}
+	return top, prefix, nil
+}
+
+func stripRepoPrefix(path, prefix string) (string, bool) {
+	if prefix == "" {
+		return path, path != ""
+	}
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	rel := strings.TrimPrefix(path, prefix)
+	return rel, rel != ""
+}
+
 // DirtyFiles returns modified, added, staged, renamed (new path) and
 // untracked non-ignored files, sorted. Deleted paths are skipped.
 func DirtyFiles(repoDir string) ([]string, error) {
-	out, err := gitOutput(repoDir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	_, prefix, err := repoLocation(repoDir)
 	if err != nil {
 		return nil, err
 	}
-	return parsePorcelainZ(out), nil
+	out, err := gitOutput(repoDir, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+	if err != nil {
+		return nil, err
+	}
+	return parsePorcelainZ(out, prefix), nil
 }
 
-func parsePorcelainZ(out []byte) []string {
+func parsePorcelainZ(out []byte, prefix string) []string {
 	recs := strings.Split(string(out), "\x00")
 	seen := map[string]bool{}
 	for i := 0; i < len(recs); i++ {
@@ -60,7 +91,11 @@ func parsePorcelainZ(out []byte) []string {
 		if x == 'D' || y == 'D' || x == '!' {
 			continue
 		}
-		seen[path] = true
+		rel, ok := stripRepoPrefix(path, prefix)
+		if !ok {
+			continue
+		}
+		seen[rel] = true
 	}
 	files := make([]string, 0, len(seen))
 	for p := range seen {
@@ -73,6 +108,11 @@ func parsePorcelainZ(out []byte) []string {
 // WorkspaceManifest computes the current HEAD SHA and a deterministic content
 // signature map for all tracked and untracked non-ignored files in repoDir.
 func WorkspaceManifest(repoDir string) (string, map[string]string, error) {
+	_, prefix, err := repoLocation(repoDir)
+	if err != nil {
+		return "", nil, err
+	}
+
 	var hostSHA string
 	if out, err := gitOutput(repoDir, "rev-parse", "HEAD"); err == nil {
 		hostSHA = strings.TrimSpace(string(out))
@@ -98,7 +138,7 @@ func WorkspaceManifest(repoDir string) (string, map[string]string, error) {
 		files[path] = "git:" + parts[1] + ":" + parts[0]
 	}
 
-	stOut, err := gitOutput(repoDir, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	stOut, err := gitOutput(repoDir, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
 	if err != nil {
 		return "", nil, err
 	}
@@ -112,7 +152,9 @@ func WorkspaceManifest(repoDir string) (string, map[string]string, error) {
 		if x == 'R' || x == 'C' {
 			if i+1 < len(recs) {
 				if x == 'R' {
-					delete(files, recs[i+1])
+					if oldRel, ok := stripRepoPrefix(recs[i+1], prefix); ok {
+						delete(files, oldRel)
+					}
 				}
 				i++
 			}
@@ -120,19 +162,23 @@ func WorkspaceManifest(repoDir string) (string, map[string]string, error) {
 		if x == '!' {
 			continue
 		}
-		if x == 'D' || y == 'D' {
-			delete(files, path)
+		rel, ok := stripRepoPrefix(path, prefix)
+		if !ok {
 			continue
 		}
-		sig, present, err := diskEntrySignature(repoDir, path)
+		if x == 'D' || y == 'D' {
+			delete(files, rel)
+			continue
+		}
+		sig, present, err := diskEntrySignature(repoDir, rel)
 		if err != nil {
 			return "", nil, err
 		}
 		if !present {
-			delete(files, path)
+			delete(files, rel)
 			continue
 		}
-		files[path] = sig
+		files[rel] = sig
 	}
 	return hostSHA, files, nil
 }
@@ -323,10 +369,16 @@ func ApplyPatch(repoDir string, patch []byte) error {
 	if cerr != nil {
 		return fmt.Errorf("close patch: %w", cerr)
 	}
-	if _, err := gitOutput(repoDir, "apply", "--check", "--binary", tmp.Name()); err != nil {
+	applyDir := repoDir
+	var dirArgs []string
+	if top, prefix, err := repoLocation(repoDir); err == nil && prefix != "" {
+		applyDir = top
+		dirArgs = []string{"--directory=" + strings.TrimSuffix(prefix, "/")}
+	}
+	if _, err := gitOutput(applyDir, append(append([]string{"apply", "--check", "--binary"}, dirArgs...), tmp.Name())...); err != nil {
 		return fmt.Errorf("patch check failed: %w", err)
 	}
-	if _, err := gitOutput(repoDir, "apply", "--binary", "--whitespace=nowarn", tmp.Name()); err != nil {
+	if _, err := gitOutput(applyDir, append(append([]string{"apply", "--binary", "--whitespace=nowarn"}, dirArgs...), tmp.Name())...); err != nil {
 		return fmt.Errorf("patch apply failed: %w", err)
 	}
 	return nil

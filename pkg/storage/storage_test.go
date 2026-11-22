@@ -313,3 +313,66 @@ func TestEncodeSyncMultipart(t *testing.T) {
 		t.Fatalf("roundtrip mismatch: meta=%+v archive=%q", gotMeta, gotArchive)
 	}
 }
+
+func TestSubdirectoryRepoSyncAndApply(t *testing.T) {
+	root := t.TempDir()
+	git(t, root, "init", "-q")
+	write(t, root, "sub/app.txt", "v1\n", 0o644)
+	write(t, root, "other/sibling.txt", "keep\n", 0o644)
+	git(t, root, "add", "-A")
+	git(t, root, "commit", "-q", "-m", "base")
+
+	subDir := filepath.Join(root, "sub")
+	_, golden, err := WorkspaceManifest(subDir)
+	if err != nil {
+		t.Fatalf("WorkspaceManifest init: %v", err)
+	}
+
+	// Dirty sibling outside subDir and add a new untracked file inside subDir.
+	write(t, root, "other/sibling.txt", "dirty outside sub\n", 0o644)
+	write(t, root, "sub/new.txt", "hello\n", 0o644)
+
+	dirty, err := DirtyFiles(subDir)
+	if err != nil {
+		t.Fatalf("DirtyFiles: %v", err)
+	}
+	if !reflect.DeepEqual(dirty, []string{"new.txt"}) {
+		t.Fatalf("DirtyFiles(subDir) = %v, want [new.txt]", dirty)
+	}
+
+	blob, err := PackWorkspace(subDir)
+	if err != nil {
+		t.Fatalf("PackWorkspace(subDir): %v", err)
+	}
+	order, _ := untar(t, blob)
+	if !reflect.DeepEqual(order, []string{"app.txt", "new.txt"}) {
+		t.Fatalf("PackWorkspace(subDir) order = %v, want [app.txt new.txt]", order)
+	}
+
+	if err := os.Remove(filepath.Join(subDir, "app.txt")); err != nil {
+		t.Fatal(err)
+	}
+	_, cur, err := WorkspaceManifest(subDir)
+	if err != nil {
+		t.Fatalf("WorkspaceManifest cur: %v", err)
+	}
+	changed, deleted := DiffManifests(golden, cur)
+	if !reflect.DeepEqual(changed, []string{"new.txt"}) || !reflect.DeepEqual(deleted, []string{"app.txt"}) {
+		t.Fatalf("DiffManifests = (changed=%v, deleted=%v), want ([new.txt], [app.txt])", changed, deleted)
+	}
+
+	// Restore app.txt cleanly, then apply a patch targeting a/app.txt from subDir.
+	git(t, root, "checkout", "--", "sub/app.txt")
+	patch := []byte("diff --git a/app.txt b/app.txt\n--- a/app.txt\n+++ b/app.txt\n@@ -1 +1 @@\n-v1\n+v2\n")
+	if err := ApplyPatch(subDir, patch); err != nil {
+		t.Fatalf("ApplyPatch(subDir): %v", err)
+	}
+	gotApp, err := os.ReadFile(filepath.Join(subDir, "app.txt"))
+	if err != nil || string(gotApp) != "v2\n" {
+		t.Fatalf("sub/app.txt = %q (%v), want %q", gotApp, err, "v2\\n")
+	}
+	gotSibling, err := os.ReadFile(filepath.Join(root, "other/sibling.txt"))
+	if err != nil || string(gotSibling) != "dirty outside sub\n" {
+		t.Fatalf("sibling altered unexpectedly: %q (%v)", gotSibling, err)
+	}
+}

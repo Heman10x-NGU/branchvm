@@ -1,11 +1,14 @@
 //go:build linux
 
 // Package pool orchestrates branchvm: the golden snapshot, N restored
-// branch VMs, promotion of one branch's diff, teardown, and verification.
+// branch VMs, branch inspection (diff, shell, logs, forward), promotion
+// of one branch's diff, teardown, and verification.
 package pool
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +24,8 @@ import (
 
 	"github.com/Heman10x-NGU/branchvm/pkg/cgroup"
 	"github.com/Heman10x-NGU/branchvm/pkg/netiso"
+	"github.com/Heman10x-NGU/branchvm/pkg/ptyclient"
+	"github.com/Heman10x-NGU/branchvm/pkg/rootfs"
 	"github.com/Heman10x-NGU/branchvm/pkg/storage"
 	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
@@ -51,13 +56,11 @@ const (
 const (
 	poolSizeGB        = 20
 	goldenRun         = "golden"
-	databaseName      = "authdemo"
 	headroomMB        = 256
 	cpuMax            = "200000 100000"
 	pidsMax           = 2048
 	maxBranches       = 254
 	goldenBootTimeout = 120 * time.Second
-	pgPort            = 5432
 )
 
 // KernelPath is the guest kernel: an uncompressed Image on arm64, vmlinux elsewhere.
@@ -76,10 +79,11 @@ func bootArgs() string {
 	return args
 }
 
-func goldenRootfs() string { return filepath.Join(GoldenDir, RootfsName) }
-func snapshotFile() string { return filepath.Join(GoldenDir, "snapshot") }
-func memFile() string      { return filepath.Join(GoldenDir, "mem") }
-func wsFile() string       { return filepath.Join(GoldenDir, "ws.bin") }
+func goldenRootfs() string   { return filepath.Join(GoldenDir, RootfsName) }
+func snapshotFile() string   { return filepath.Join(GoldenDir, "snapshot") }
+func memFile() string        { return filepath.Join(GoldenDir, "mem") }
+func wsFile() string         { return filepath.Join(GoldenDir, "ws.bin") }
+func goldenMetaFile() string { return filepath.Join(GoldenDir, "meta.json") }
 
 // PrefaultRestore is a File restore preceded by posix_fadvise(WILLNEED)
 // over the pages recorded in golden/ws.bin.
@@ -90,11 +94,9 @@ const PrefaultRestore types.RestoreMode = "prefault-file"
 func GoldenMemPath() string  { return memFile() }
 func WorkingSetPath() string { return wsFile() }
 
-// BenchPreflight runs the checks Init and Run make before touching VMs:
-// assets present, pool mounted, crashed runs reaped, no live run, and a
-// complete golden snapshot.
+// BenchPreflight runs the checks Init and Run make before touching VMs.
 func BenchPreflight(out io.Writer) error {
-	if err := checkPrereqs(); err != nil {
+	if err := checkPrereqs(""); err != nil {
 		return err
 	}
 	if err := prepareHost(out); err != nil {
@@ -102,6 +104,7 @@ func BenchPreflight(out io.Writer) error {
 	}
 	return requireGolden()
 }
+
 func cloneDir(runID string, i int) string {
 	return filepath.Join(ClonesDir, fmt.Sprintf("%s-%d", runID, i))
 }
@@ -132,22 +135,61 @@ func newRunID() string {
 
 // InitOptions configures Init.
 type InitOptions struct {
-	Repo    string
-	MemMB   int64
-	VCPUs   int
-	WarmCmd string
-	Out     io.Writer
+	Repo         string
+	Image        string
+	Dockerfile   string
+	ExecdPath    string
+	RootfsSizeMB int64
+	MemMB        int64
+	VCPUs        int
+	WarmCmd      string
+	Database     string
+	Services     []types.ServiceSpec
+	Env          []string
+	Providers    []types.ProviderSpec
+	Out          io.Writer
 }
 
-// Init brings up the XFS pool, cold boots the golden VM from a copy of the
-// base rootfs, syncs the repo, checkpoints, and writes the golden snapshot.
+// Init builds or selects the rootfs, brings up the XFS pool, cold boots
+// the golden VM, syncs the repo, checkpoints, writes the snapshot, and saves
+// golden/meta.json.
 func Init(ctx context.Context, opt InitOptions) error {
+	if opt.Out == nil {
+		opt.Out = io.Discard
+	}
 	if opt.MemMB < 128 || opt.VCPUs < 1 || opt.VCPUs > 32 {
 		return fmt.Errorf("init: need --mem >= 128 and 1 <= --cpus <= 32, got %d MiB, %d cpus", opt.MemMB, opt.VCPUs)
 	}
-	if err := checkPrereqs(); err != nil {
-		return err
+	if opt.Services == nil {
+		opt.Services = []types.ServiceSpec{}
 	}
+
+	sourceRootfs := BaseRootfs
+	var imageDigest string
+	if opt.Image != "" || opt.Dockerfile != "" {
+		if err := checkPrereqs("oci"); err != nil {
+			return err
+		}
+		res, err := rootfs.BuildFromImage(ctx, rootfs.BuildOptions{
+			Image:        opt.Image,
+			Dockerfile:   opt.Dockerfile,
+			RepoDir:      opt.Repo,
+			ExecdPath:    opt.ExecdPath,
+			Services:     opt.Services,
+			RootfsSizeMB: opt.RootfsSizeMB,
+			Out:          opt.Out,
+		})
+		if err != nil {
+			return fmt.Errorf("build rootfs from container image: %w", err)
+		}
+		sourceRootfs = res.RootfsPath
+		imageDigest = res.ImageDigest
+	} else {
+		if err := checkPrereqs(""); err != nil {
+			return err
+		}
+	}
+
 	if err := prepareHost(opt.Out); err != nil {
 		return err
 	}
@@ -155,24 +197,49 @@ func Init(ctx context.Context, opt InitOptions) error {
 	defer cancel()
 	cgroup.InstallCleanupTrap(cancel)
 	start := time.Now()
-	if err := prepareGoldenDisk(opt.Out); err != nil {
+	if err := prepareGoldenDisk(sourceRootfs, opt.Out); err != nil {
 		return err
+	}
+	hostSHA, goldenFiles, err := storage.WorkspaceManifest(opt.Repo)
+	if err != nil {
+		return fmt.Errorf("manifest %s: %w", opt.Repo, err)
 	}
 	if err := bootGolden(ctx, opt); err != nil {
 		return err
 	}
-	fmt.Fprintf(opt.Out, "golden snapshot ready in %s\n", time.Since(start).Round(time.Millisecond))
+	meta := types.GoldenMeta{
+		RepoPath:    filepath.Clean(opt.Repo),
+		HostSHA:     hostSHA,
+		Image:       opt.Image,
+		Dockerfile:  opt.Dockerfile,
+		ImageDigest: imageDigest,
+		MemMB:       opt.MemMB,
+		VCPUs:       opt.VCPUs,
+		Database:    opt.Database,
+		Services:    opt.Services,
+		Env:         opt.Env,
+		Providers:   opt.Providers,
+		GoldenFiles: goldenFiles,
+	}
+	if err := saveGoldenMeta(meta); err != nil {
+		return err
+	}
+	fmt.Fprintf(opt.Out, "golden snapshot ready in %s (%d tracked/dirty files)\n",
+		time.Since(start).Round(time.Millisecond), len(goldenFiles))
 	for _, p := range []string{goldenRootfs(), snapshotFile(), memFile()} {
 		fmt.Fprintln(opt.Out, "  "+sizeLine(p))
 	}
 	return nil
 }
 
-func checkPrereqs() error {
-	for _, p := range []struct{ path, hint string }{
-		{BaseRootfs, "run scripts/build-rootfs.sh first"},
+func checkPrereqs(mode string) error {
+	checks := []struct{ path, hint string }{
 		{KernelPath(), "run scripts/fetch-assets.sh first"},
-	} {
+	}
+	if mode != "oci" {
+		checks = append(checks, struct{ path, hint string }{BaseRootfs, "run scripts/build-rootfs.sh or set image/dockerfile in branchvm.toml"})
+	}
+	for _, p := range checks {
 		if _, err := os.Stat(p.path); err != nil {
 			return fmt.Errorf("%s: %w (%s)", p.path, err, p.hint)
 		}
@@ -183,8 +250,6 @@ func checkPrereqs() error {
 	return nil
 }
 
-// prepareHost mounts the pool, reaps crashed runs, and refuses to continue
-// while another run still owns live VMs (branch IPs are per index).
 func prepareHost(out io.Writer) error {
 	if err := storage.EnsurePool(PoolImage, PoolMount, poolSizeGB); err != nil {
 		return fmt.Errorf("xfs pool: %w", err)
@@ -207,18 +272,15 @@ func refuseLiveRuns() error {
 	for _, r := range runs {
 		for _, b := range r.Branches {
 			if isFirecracker(b.FirecrackerPID) {
-				return fmt.Errorf("run %s still has live VMs (branch %d, pid %d): promote one with `branchvm apply <i> --run %s` or discard it with `branchvm gc --run %s`",
-					r.RunID, b.Index, b.FirecrackerPID, r.RunID, r.RunID)
+				return fmt.Errorf("run %s still has live VMs (branch %d, pid %d): inspect with `branchvm diff <i> --run %s`, promote with `branchvm apply <i> --run %s`, or discard with `branchvm gc --run %s`",
+					r.RunID, b.Index, b.FirecrackerPID, r.RunID, r.RunID, r.RunID)
 			}
 		}
 	}
 	return nil
 }
 
-// prepareGoldenDisk copies the base rootfs into the pool. The base usually
-// lives outside the XFS pool, where reflink cannot reach, so a sparse copy
-// is the fallback; golden to clone copies are always reflinks.
-func prepareGoldenDisk(out io.Writer) error {
+func prepareGoldenDisk(sourceRootfs string, out io.Writer) error {
 	if err := os.MkdirAll(GoldenDir, 0o755); err != nil {
 		return fmt.Errorf("create golden dir: %w", err)
 	}
@@ -226,15 +288,53 @@ func prepareGoldenDisk(out io.Writer) error {
 	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove old golden rootfs: %w", err)
 	}
-	if err := storage.CloneRootfs(BaseRootfs, dst); err == nil {
-		fmt.Fprintf(out, "golden rootfs: reflink of %s\n", BaseRootfs)
+	if err := storage.CloneRootfs(sourceRootfs, dst); err == nil {
+		fmt.Fprintf(out, "golden rootfs: reflink of %s\n", sourceRootfs)
 		return nil
 	}
-	if b, err := exec.Command("cp", "--sparse=always", BaseRootfs, dst).CombinedOutput(); err != nil {
+	if b, err := exec.Command("cp", "--sparse=always", sourceRootfs, dst).CombinedOutput(); err != nil {
 		return fmt.Errorf("copy base rootfs to %s: %w: %s", dst, err, strings.TrimSpace(string(b)))
 	}
-	fmt.Fprintf(out, "golden rootfs: sparse copy of %s (base is outside the XFS pool)\n", BaseRootfs)
+	fmt.Fprintf(out, "golden rootfs: sparse copy of %s\n", sourceRootfs)
 	return nil
+}
+
+func saveGoldenMeta(meta types.GoldenMeta) error {
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode golden meta: %w", err)
+	}
+	tmp := goldenMetaFile() + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write golden meta: %w", err)
+	}
+	if err := os.Rename(tmp, goldenMetaFile()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("install golden meta: %w", err)
+	}
+	return nil
+}
+
+func loadGoldenMeta() (types.GoldenMeta, bool, error) {
+	raw, err := os.ReadFile(goldenMetaFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return types.GoldenMeta{
+			MemMB:    1024,
+			VCPUs:    2,
+			Services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}},
+		}, false, nil
+	}
+	if err != nil {
+		return types.GoldenMeta{}, false, fmt.Errorf("read %s: %w", goldenMetaFile(), err)
+	}
+	var meta types.GoldenMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return types.GoldenMeta{}, false, fmt.Errorf("parse %s: %w", goldenMetaFile(), err)
+	}
+	if meta.Services == nil {
+		meta.Services = []types.ServiceSpec{}
+	}
+	return meta, true, nil
 }
 
 func bootGolden(ctx context.Context, opt InitOptions) (err error) {
@@ -268,7 +368,7 @@ func bootGolden(ctx context.Context, opt InitOptions) (err error) {
 }
 
 func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error {
-	fmt.Fprintf(opt.Out, "booting golden VM (%s, %d MiB, %d vCPUs), waiting for Postgres\n", KernelPath(), opt.MemMB, opt.VCPUs)
+	fmt.Fprintf(opt.Out, "booting golden VM (%s, %d MiB, %d vCPUs), waiting for services\n", KernelPath(), opt.MemMB, opt.VCPUs)
 	last := time.Duration(0)
 	progress := func(elapsed time.Duration, cause error) {
 		if elapsed-last >= 5*time.Second {
@@ -283,11 +383,17 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 	if err != nil {
 		return fmt.Errorf("pack workspace %s: %w", opt.Repo, err)
 	}
-	if err := g.sync(ctx, tgz); err != nil {
-		return fmt.Errorf("golden sync (%d bytes): %w", len(tgz), err)
+	body, ctype, err := storage.EncodeSyncMultipart(types.SyncMeta{Mode: "full"}, tgz)
+	if err != nil {
+		return fmt.Errorf("encode golden sync: %w", err)
 	}
-	if err := ensureDatabase(ctx, g); err != nil {
-		return err
+	if err := g.syncPayload(ctx, ctype, body); err != nil {
+		return fmt.Errorf("golden sync (%d bytes): %w", len(body), err)
+	}
+	if opt.Database != "" && hasPostgres(opt.Services) {
+		if err := ensureDatabase(ctx, g, opt.Database); err != nil {
+			return err
+		}
 	}
 	if err := warmGolden(ctx, opt, g); err != nil {
 		return err
@@ -305,10 +411,6 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 	return nil
 }
 
-// recordWorkingSet saves golden/ws.bin from the page cache residency of
-// the mem file Firecracker just wrote. Freshly written pages are all
-// cached, so this approximates the whole file until `branchvm bench`
-// re-records it from a cold restore. It is optional, so failure warns.
 func recordWorkingSet(out io.Writer) {
 	ws, err := storage.RecordWorkingSet(memFile(), wsFile())
 	if err != nil {
@@ -319,19 +421,17 @@ func recordWorkingSet(out io.Writer) {
 	fmt.Fprintf(out, "working set: %d of %d pages resident (%d MiB) in %s\n", ws.Resident, ws.Pages, ws.ResidentBytes()>>20, wsFile())
 }
 
-// warmGolden runs an optional command in the golden /workspace before the
-// checkpoint. Clones inherit its side effects (a hot Go build cache, warmed
-// package data) through the CoW disk, so per-branch commands skip cold work
-// that a 1 GiB guest pays for dearly.
 func warmGolden(ctx context.Context, opt InitOptions, g *guest) error {
 	if opt.WarmCmd == "" {
 		return nil
 	}
 	fmt.Fprintf(opt.Out, "warming golden workspace: %s\n", opt.WarmCmd)
 	start := time.Now()
+	env := append([]string(nil), opt.Env...)
+	env = append(env, "HOME=/root", "GOTOOLCHAIN=local")
 	res, err := g.exec(ctx, types.ExecRequest{
 		Cmd:        []string{"sh", "-c", opt.WarmCmd},
-		Env:        []string{"HOME=/root", "GOTOOLCHAIN=local"},
+		Env:        env,
 		TimeoutSec: 900,
 	})
 	if err != nil {
@@ -344,20 +444,18 @@ func warmGolden(ctx context.Context, opt InitOptions, g *guest) error {
 	return nil
 }
 
-func ensureDatabase(ctx context.Context, g *guest) error {
-	script := fmt.Sprintf(`psql -h 127.0.0.1 -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='%[1]s'" | grep -q 1 || createdb -h 127.0.0.1 -U postgres %[1]s`, databaseName)
+func ensureDatabase(ctx context.Context, g *guest, dbName string) error {
+	script := fmt.Sprintf(`psql -h 127.0.0.1 -U postgres -tAc "SELECT 1 FROM pg_database WHERE datname='%[1]s'" | grep -q 1 || createdb -h 127.0.0.1 -U postgres %[1]s`, dbName)
 	res, err := g.exec(ctx, types.ExecRequest{Cmd: []string{"sh", "-c", script}, TimeoutSec: 60})
 	if err != nil {
-		return fmt.Errorf("create database %s: %w", databaseName, err)
+		return fmt.Errorf("create database %s: %w", dbName, err)
 	}
 	if res.ExitCode != 0 {
-		return fmt.Errorf("create database %s: exit %d: %s", databaseName, res.ExitCode, strings.TrimSpace(res.Stderr))
+		return fmt.Errorf("create database %s: exit %d: %s", dbName, res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return nil
 }
 
-// writeSnapshot writes to temp names and renames, so a re-init gives the
-// files fresh inodes instead of rewriting a mem file a clone has mapped.
 func writeSnapshot(v *vm) error {
 	snapTmp, memTmp := snapshotFile()+".tmp", memFile()+".tmp"
 	for _, p := range []string{snapTmp, memTmp} {
@@ -403,17 +501,68 @@ type RunOptions struct {
 	Repo        string
 	Branches    int
 	MemMB       int64
+	MemExplicit bool
 	TimeoutSec  int
 	RestoreMode types.RestoreMode
 	Cmd         []string
 	Out         io.Writer
 }
 
-// Run restores N branches concurrently, runs Cmd in each, stores each diff,
-// and leaves the VMs running for apply. Ctrl-C tears everything down.
+type syncUpload struct {
+	skip        bool
+	contentType string
+	body        []byte
+	desc        string
+}
+
+func buildRunSync(repoDir string, meta types.GoldenMeta, hasMeta bool) (syncUpload, error) {
+	if hasMeta && meta.GoldenFiles != nil {
+		_, curFiles, err := storage.WorkspaceManifest(repoDir)
+		if err != nil {
+			return syncUpload{}, fmt.Errorf("manifest %s: %w", repoDir, err)
+		}
+		changed, deleted := storage.DiffManifests(meta.GoldenFiles, curFiles)
+		if len(changed) == 0 && len(deleted) == 0 {
+			return syncUpload{skip: true, desc: "delta: 0 changed, 0 deleted (sync skipped)"}, nil
+		}
+		var archive []byte
+		if len(changed) > 0 {
+			archive, err = storage.PackFiles(repoDir, changed)
+			if err != nil {
+				return syncUpload{}, fmt.Errorf("pack delta %s: %w", repoDir, err)
+			}
+		}
+		body, ctype, err := storage.EncodeSyncMultipart(types.SyncMeta{Mode: "delta", Delete: deleted}, archive)
+		if err != nil {
+			return syncUpload{}, err
+		}
+		return syncUpload{
+			contentType: ctype,
+			body:        body,
+			desc:        fmt.Sprintf("delta: %d changed, %d deleted, %d KiB", len(changed), len(deleted), len(body)>>10),
+		}, nil
+	}
+	tgz, err := storage.PackWorkspace(repoDir)
+	if err != nil {
+		return syncUpload{}, fmt.Errorf("pack workspace %s: %w", repoDir, err)
+	}
+	body, ctype, err := storage.EncodeSyncMultipart(types.SyncMeta{Mode: "full"}, tgz)
+	if err != nil {
+		return syncUpload{}, err
+	}
+	return syncUpload{
+		contentType: ctype,
+		body:        body,
+		desc:        fmt.Sprintf("full workspace %d KiB", len(body)>>10),
+	}, nil
+}
+
+// Run restores N branches concurrently, syncs delta changes, runs Cmd in
+// each, stores each diff and log, and leaves the VMs running for inspection
+// and apply. Ctrl-C tears everything down.
 func Run(ctx context.Context, opt RunOptions) error {
-	if opt.Branches < 1 || opt.Branches > maxBranches || len(opt.Cmd) == 0 || opt.MemMB < 128 || opt.TimeoutSec < 1 {
-		return fmt.Errorf("run: need 1 <= --branches <= %d, --mem >= 128, --timeout >= 1, and a command after --", maxBranches)
+	if opt.Branches < 1 || opt.Branches > maxBranches || len(opt.Cmd) == 0 || opt.TimeoutSec < 1 {
+		return fmt.Errorf("run: need 1 <= --branches <= %d, --timeout >= 1, and a command after --", maxBranches)
 	}
 	if err := prepareHost(opt.Out); err != nil {
 		return err
@@ -421,23 +570,45 @@ func Run(ctx context.Context, opt RunOptions) error {
 	if err := requireGolden(); err != nil {
 		return err
 	}
-	tgz, err := storage.PackWorkspace(opt.Repo)
+	meta, hasMeta, err := loadGoldenMeta()
 	if err != nil {
-		return fmt.Errorf("pack workspace %s: %w", opt.Repo, err)
+		return err
 	}
+	if hasMeta && meta.RepoPath != "" && filepath.Clean(meta.RepoPath) != filepath.Clean(opt.Repo) {
+		return fmt.Errorf("golden snapshot belongs to %s, not %s: run `branchvm init` in %s first",
+			meta.RepoPath, opt.Repo, opt.Repo)
+	}
+	if !opt.MemExplicit && meta.MemMB >= 128 {
+		opt.MemMB = meta.MemMB
+	}
+	if opt.MemMB < 128 {
+		return fmt.Errorf("run: --mem must be >= 128, got %d", opt.MemMB)
+	}
+
+	syncData, err := buildRunSync(opt.Repo, meta, hasMeta)
+	if err != nil {
+		return err
+	}
+	bcfg := branchConfigFromMeta(meta)
+	portLabel := "-"
+	if hasPostgres(bcfg.Services) {
+		portLabel = "5432"
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cgroup.InstallCleanupTrap(cancel)
 	rec := newRecorder(newRunID(), opt.Branches, opt.Out)
-	fmt.Fprintf(opt.Out, "run %s: %d branches, cmd %q, workspace %d KiB\n", rec.runID(), opt.Branches, opt.Cmd, len(tgz)>>10)
-	tab := newTable(opt.Out, opt.Branches)
+	fmt.Fprintf(opt.Out, "run %s: %d branches, mem %d MiB, cmd %q, %s\n",
+		rec.runID(), opt.Branches, opt.MemMB, opt.Cmd, syncData.desc)
+	tab := newTable(opt.Out, opt.Branches, portLabel)
 	branches := make([]*Branch, opt.Branches)
 	var wg sync.WaitGroup
 	for i := 1; i <= opt.Branches; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			branches[i-1] = runBranch(ctx, rec, tab, opt, tgz, i)
+			branches[i-1] = runBranch(ctx, rec, tab, opt, bcfg, syncData, i)
 		}(i)
 	}
 	wg.Wait()
@@ -445,17 +616,31 @@ func Run(ctx context.Context, opt RunOptions) error {
 		terr := teardownRun(rec.snapshot(), branches)
 		return errors.Join(fmt.Errorf("interrupted: run %s torn down", rec.runID()), terr)
 	}
+	snap := rec.snapshot()
 	printRunNext(opt.Out, rec.runID(), branches)
+	if countPassed(snap.Branches) == 0 {
+		return fmt.Errorf("run %s: 0 of %d branches passed", rec.runID(), len(snap.Branches))
+	}
 	return nil
 }
 
-func runBranch(ctx context.Context, rec *recorder, tab *table, opt RunOptions, tgz []byte, i int) *Branch {
+func countPassed(branches []types.BranchState) int {
+	n := 0
+	for _, b := range branches {
+		if b.Status == StatusPass {
+			n++
+		}
+	}
+	return n
+}
+
+func runBranch(ctx context.Context, rec *recorder, tab *table, opt RunOptions, bcfg BranchConfig, syncData syncUpload, i int) *Branch {
 	tab.update(i, func(r *row) { r.status = StatusStarting })
 	mode := opt.RestoreMode
 	if mode == "" {
 		mode = types.FileRestore
 	}
-	b, err := LaunchBranch(ctx, rec.runID(), i, opt.MemMB, mode, rec.set)
+	b, err := LaunchBranchConfigured(ctx, rec.runID(), i, opt.MemMB, mode, bcfg, rec.set)
 	if err != nil {
 		rec.setStatus(i, StatusError)
 		tab.update(i, func(r *row) { r.status, r.note = StatusError, err.Error() })
@@ -463,15 +648,17 @@ func runBranch(ctx context.Context, rec *recorder, tab *table, opt RunOptions, t
 	}
 	rec.set(b.State(StatusRunning))
 	tab.update(i, func(r *row) { r.status, r.restoreMs, r.ramMB = StatusRunning, b.RestoreMs, b.MemMB() })
-	status, note := execBranch(ctx, b, opt, tgz)
+	status, note := execBranch(ctx, b, opt, syncData)
 	rec.set(b.State(status))
 	tab.update(i, func(r *row) { r.status, r.note, r.ramMB = status, note, b.MemMB() })
 	return b
 }
 
-func execBranch(ctx context.Context, b *Branch, opt RunOptions, tgz []byte) (string, string) {
-	if err := b.Guest.sync(ctx, tgz); err != nil {
-		return StatusError, err.Error()
+func execBranch(ctx context.Context, b *Branch, opt RunOptions, syncData syncUpload) (string, string) {
+	if !syncData.skip {
+		if err := b.SyncMultipart(ctx, syncData.contentType, syncData.body); err != nil {
+			return StatusError, err.Error()
+		}
 	}
 	res, err := b.Exec(ctx, opt.Cmd, opt.TimeoutSec)
 	if err != nil {
@@ -513,8 +700,12 @@ func printRunNext(out io.Writer, runID string, branches []*Branch) {
 	}
 	prefix := filepath.Join(RunsDir, runID+"-branch-<i>")
 	fmt.Fprintf(out, "\nrun %s: %d VMs left running; patches %s.patch, output %s.out\n", runID, live, prefix, prefix)
-	fmt.Fprintf(out, "  promote one: branchvm apply <i> --run %s   (from the repo dir, or pass --repo)\n", runID)
-	fmt.Fprintf(out, "  discard all: branchvm gc --run %s\n", runID)
+	fmt.Fprintf(out, "  read logs:     branchvm logs <i> --run %s\n", runID)
+	fmt.Fprintf(out, "  inspect diff:  branchvm diff <i> --run %s\n", runID)
+	fmt.Fprintf(out, "  shell inside:  branchvm shell <i> --run %s\n", runID)
+	fmt.Fprintf(out, "  forward port:  branchvm forward <i> <port> --run %s\n", runID)
+	fmt.Fprintf(out, "  promote one:   branchvm apply <i> --run %s\n", runID)
+	fmt.Fprintf(out, "  discard all:   branchvm gc --all\n")
 }
 
 // recorder persists run state after every change for crash safety.
@@ -566,8 +757,6 @@ func (r *recorder) snapshot() types.RunState {
 	return st
 }
 
-// table prints the live branch table: redrawn in place on a terminal,
-// one log line per change otherwise.
 type row struct {
 	restoreMs, ramMB int64
 	status, note     string
@@ -577,14 +766,15 @@ type table struct {
 	mu    sync.Mutex
 	out   io.Writer
 	tty   bool
+	port  string
 	rows  []row
 	drawn bool
 }
 
-const tableHeader = "BRANCH RESTORE_MS PG_PORT HOST_RAM_MB STATUS   NOTE"
+const tableHeader = "BRANCH RESTORE_MS PORT    HOST_RAM_MB STATUS   NOTE"
 
-func newTable(out io.Writer, n int) *table {
-	t := &table{out: out, rows: make([]row, n)}
+func newTable(out io.Writer, n int, portLabel string) *table {
+	t := &table{out: out, port: portLabel, rows: make([]row, n)}
 	if f, ok := out.(*os.File); ok {
 		if fi, err := f.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
 			t.tty = true
@@ -626,7 +816,7 @@ func (t *table) line(i int) string {
 	if t.tty && len(note) > 70 {
 		note = note[:67] + "..."
 	}
-	return fmt.Sprintf("%-6d %-10s %-7d %-11s %-8s %s", i, num(r.restoreMs), pgPort, num(r.ramMB), r.status, note)
+	return fmt.Sprintf("%-6d %-10s %-7s %-11s %-8s %s", i, num(r.restoreMs), t.port, num(r.ramMB), r.status, note)
 }
 
 // ApplyOptions configures Apply.
@@ -640,20 +830,11 @@ type ApplyOptions struct {
 // Apply applies one branch's diff to the host repo, then tears down the
 // whole run and scans for leaks.
 func Apply(ctx context.Context, opt ApplyOptions) error {
-	st, err := resolveRun(opt.RunID)
+	st, bs, err := resolveBranch(opt.RunID, opt.Index)
 	if err != nil {
 		return err
 	}
-	var bs *types.BranchState
-	for i := range st.Branches {
-		if st.Branches[i].Index == opt.Index {
-			bs = &st.Branches[i]
-		}
-	}
-	if bs == nil {
-		return fmt.Errorf("run %s has no branch %d", st.RunID, opt.Index)
-	}
-	patch, err := loadPatch(ctx, st.RunID, *bs)
+	patch, err := loadPatch(ctx, st.RunID, bs)
 	if err != nil {
 		return err
 	}
@@ -673,6 +854,178 @@ func Apply(ctx context.Context, opt ApplyOptions) error {
 	}
 	fmt.Fprintf(opt.Out, "run %s torn down; applied patch kept at %s\n", st.RunID, kept)
 	return reportLeaks(opt.Out, gatewayAddrs(st))
+}
+
+// DiffOptions configures Diff.
+type DiffOptions struct {
+	Index int
+	RunID string
+	Stat  bool
+	Out   io.Writer
+}
+
+// Diff prints the diff of branch Index (live from the VM when running).
+func Diff(ctx context.Context, opt DiffOptions) error {
+	st, bs, err := resolveBranch(opt.RunID, opt.Index)
+	if err != nil {
+		return err
+	}
+	patch, err := loadPatch(ctx, st.RunID, bs)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(patch)) == 0 {
+		fmt.Fprintf(opt.Out, "(no changes on branch %d of run %s)\n", opt.Index, st.RunID)
+		return nil
+	}
+	if opt.Stat {
+		return writeDiffStat(ctx, patch, opt.Out)
+	}
+	_, err = opt.Out.Write(patch)
+	return err
+}
+
+func writeDiffStat(ctx context.Context, patch []byte, out io.Writer) error {
+	cmd := exec.CommandContext(ctx, "git", "apply", "--stat", "--summary")
+	// Run outside any git worktree so git apply does not drop patch paths
+	// when branchvm is invoked from a subdirectory of a parent repo.
+	cmd.Dir = os.TempDir()
+	cmd.Stdin = bytes.NewReader(patch)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("diff stat: %w", err)
+	}
+	return nil
+}
+
+// LogsOptions configures Logs.
+type LogsOptions struct {
+	Index int
+	RunID string
+	Out   io.Writer
+}
+
+// Logs prints the saved command stdout and stderr for branch Index.
+func Logs(opt LogsOptions) error {
+	st, bs, err := resolveBranch(opt.RunID, opt.Index)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(outputPath(st.RunID, bs.Index))
+	if err != nil {
+		return fmt.Errorf("read logs for branch %d of run %s: %w", bs.Index, st.RunID, err)
+	}
+	_, err = opt.Out.Write(raw)
+	return err
+}
+
+// ShellOptions configures Shell.
+type ShellOptions struct {
+	Index      int
+	RunID      string
+	Cmd        []string
+	TimeoutSec int
+	Stdin      *os.File
+	Stdout     io.Writer
+}
+
+func shellContext(ctx context.Context, cmd []string, timeoutSec int) (context.Context, context.CancelFunc) {
+	if len(cmd) > 0 && timeoutSec > 0 {
+		return context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	}
+	return ctx, func() {}
+}
+
+// Shell opens an interactive PTY shell (or runs Cmd) inside a live branch VM
+// with a temporary host LLM gateway attached for the session lifetime.
+func Shell(ctx context.Context, opt ShellOptions) (int, error) {
+	if opt.TimeoutSec < 0 {
+		return 1, fmt.Errorf("shell: --timeout must be >= 0, got %d", opt.TimeoutSec)
+	}
+	st, bs, err := resolveBranch(opt.RunID, opt.Index)
+	if err != nil {
+		return 1, err
+	}
+	if !isFirecracker(bs.FirecrackerPID) {
+		return 1, fmt.Errorf("branch %d of run %s is not running", opt.Index, st.RunID)
+	}
+	meta, _, err := loadGoldenMeta()
+	if err != nil {
+		return 1, err
+	}
+
+	b := &Branch{
+		RunID: st.RunID,
+		Index: bs.Index,
+		Net: &netiso.Net{
+			GatewayAddr:  fmt.Sprintf("%s:%d", netiso.HostIP(bs.Index), netiso.GatewayPort),
+			GuestAPIAddr: fmt.Sprintf("%s:%d", netiso.NSVethIP(bs.Index), netiso.GuestAPIPort),
+		},
+		cfg: branchConfigFromMeta(meta),
+	}
+	if err := b.startGateway(); err != nil {
+		return 1, err
+	}
+	defer b.stopGateway()
+
+	shellCtx, cancel := shellContext(ctx, opt.Cmd, opt.TimeoutSec)
+	defer cancel()
+
+	env := b.Env()
+	if term := os.Getenv("TERM"); term != "" {
+		env = append(env, "TERM="+term)
+	}
+	code, err := ptyclient.Attach(shellCtx, b.Net.GuestAPIAddr, types.PTYRequest{
+		Cmd: opt.Cmd,
+		Env: env,
+	}, opt.Stdin, opt.Stdout)
+	if errors.Is(shellCtx.Err(), context.DeadlineExceeded) {
+		return 124, fmt.Errorf("branch %d: shell command timed out after %ds", opt.Index, opt.TimeoutSec)
+	}
+	return code, err
+}
+
+// ForwardOptions configures Forward.
+type ForwardOptions struct {
+	Index     int
+	RunID     string
+	GuestPort int
+	HostPort  int
+	Out       io.Writer
+}
+
+// Forward exposes guest localhost:GuestPort on host 127.0.0.1:HostPort until canceled.
+func Forward(ctx context.Context, opt ForwardOptions) error {
+	st, bs, err := resolveBranch(opt.RunID, opt.Index)
+	if err != nil {
+		return err
+	}
+	if !isFirecracker(bs.FirecrackerPID) {
+		return fmt.Errorf("branch %d of run %s is not running", opt.Index, st.RunID)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cgroup.InstallCleanupTrap(cancel)
+
+	apiAddr := fmt.Sprintf("%s:%d", netiso.NSVethIP(bs.Index), netiso.GuestAPIPort)
+	return ptyclient.Forward(ctx, apiAddr, opt.GuestPort, opt.HostPort, func(actual int) {
+		fmt.Fprintf(opt.Out, "forwarding 127.0.0.1:%d -> branch %d (run %s) 127.0.0.1:%d (Ctrl-C to stop)\n",
+			actual, bs.Index, st.RunID, opt.GuestPort)
+	})
+}
+
+func resolveBranch(runID string, idx int) (types.RunState, types.BranchState, error) {
+	st, err := resolveRun(runID)
+	if err != nil {
+		return types.RunState{}, types.BranchState{}, err
+	}
+	for _, b := range st.Branches {
+		if b.Index == idx {
+			return st, b, nil
+		}
+	}
+	return types.RunState{}, types.BranchState{}, fmt.Errorf("run %s has no branch %d", st.RunID, idx)
 }
 
 func resolveRun(runID string) (types.RunState, error) {
@@ -695,24 +1048,25 @@ func resolveRun(runID string) (types.RunState, error) {
 	return *best, nil
 }
 
+// loadPatch queries the live guest /diff first so edits made inside
+// `branchvm shell` are always reflected in `branchvm diff` and `apply`.
 func loadPatch(ctx context.Context, runID string, bs types.BranchState) ([]byte, error) {
-	patch, err := os.ReadFile(patchPath(runID, bs.Index))
-	if err == nil {
+	if isFirecracker(bs.FirecrackerPID) {
+		g := newGuest(fmt.Sprintf("%s:%d", netiso.NSVethIP(bs.Index), netiso.GuestAPIPort))
+		patch, err := g.diff(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("live diff for branch %d: %w", bs.Index, err)
+		}
+		_ = os.WriteFile(patchPath(runID, bs.Index), patch, 0o644)
 		return patch, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) || !isFirecracker(bs.FirecrackerPID) {
-		return nil, fmt.Errorf("read patch for branch %d: %w", bs.Index, err)
-	}
-	g := newGuest(fmt.Sprintf("%s:%d", netiso.NSVethIP(bs.Index), netiso.GuestAPIPort))
-	patch, err = g.diff(ctx)
+	patch, err := os.ReadFile(patchPath(runID, bs.Index))
 	if err != nil {
-		return nil, fmt.Errorf("live diff for branch %d: %w", bs.Index, err)
+		return nil, fmt.Errorf("read patch for branch %d: %w", bs.Index, err)
 	}
 	return patch, nil
 }
 
-// teardownRun stops in-process gateways and VMs, removes every branch's
-// resources, and deletes the run state file.
 func teardownRun(st types.RunState, live []*Branch) error {
 	for _, b := range live {
 		if b != nil {
@@ -773,6 +1127,26 @@ func GC(out io.Writer, runID string) error {
 	printGCReport(out, rep)
 	if len(rep.Errors) > 0 {
 		return fmt.Errorf("gc: %d errors", len(rep.Errors))
+	}
+	return nil
+}
+
+// GCAll reaps dead runs and tears down all active runs cleanly.
+func GCAll(out io.Writer) error {
+	if err := GC(out, ""); err != nil {
+		return err
+	}
+	runs, err := cgroup.List(RunsDir)
+	if err != nil {
+		return fmt.Errorf("list runs: %w", err)
+	}
+	for _, r := range runs {
+		if r.RunID == goldenRun {
+			continue
+		}
+		if err := GC(out, r.RunID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

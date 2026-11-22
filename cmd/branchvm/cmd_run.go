@@ -19,7 +19,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	branches := fs.Int("branches", 0, "number of branch VMs")
 	repo := fs.String("repo", "", "git repo to sync into each branch (default: current dir)")
-	mem := fs.Int64("mem", 1024, "guest memory in MiB; the cgroup limit adds 256 MiB headroom")
+	mem := fs.Int64("mem", 1024, "guest memory in MiB (default: inherited from init; cgroup adds 256 MiB headroom)")
 	timeout := fs.Int("timeout", 600, "per-branch command timeout in seconds")
 	pager := fs.String("pager", "mmap", "snapshot memory pager: mmap, fadvise, or uffd")
 	if err := fs.Parse(args); err != nil {
@@ -39,8 +39,18 @@ func cmdRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
 	return pool.Run(ctx, pool.RunOptions{
-		Repo: dir, Branches: *branches, MemMB: *mem, TimeoutSec: *timeout, RestoreMode: mode, Cmd: fs.Args(), Out: os.Stdout,
+		Repo:        dir,
+		Branches:    *branches,
+		MemMB:       *mem,
+		MemExplicit: explicit["mem"],
+		TimeoutSec:  *timeout,
+		RestoreMode: mode,
+		Cmd:         fs.Args(),
+		Out:         os.Stdout,
 	})
 }
 

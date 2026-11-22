@@ -27,22 +27,56 @@ import (
 )
 
 const (
-	uffdSockName   = "uffd.sock"
-	coldVCPUs      = 2
-	sockName       = "firecracker.sock"
-	logName        = "firecracker.log"
-	guestMAC       = "AA:FC:00:00:00:01"
-	tapMAC         = "06:00:ac:10:00:01"
+	uffdSockName  = "uffd.sock"
+	coldVCPUs     = 2
+	sockName      = "firecracker.sock"
+	logName       = "firecracker.log"
+	guestMAC      = "AA:FC:00:00:00:01"
+	tapMAC        = "06:00:ac:10:00:01"
 	socketTimeout = 5 * time.Second
 	killTimeout   = 5 * time.Second
-	maxGuestBody   = 256 << 20
-	databaseURL   = "postgres://postgres@127.0.0.1:5432/" + databaseName + "?sslmode=disable"
+	maxGuestBody  = 256 << 20
 )
 
 // RestoreTimeout caps how long a restored guest may take to serve /health.
 // Many concurrent cold restores stampede one disk, so the bench raises it;
 // the measured first-query time, not this cap, is the reported number.
 var RestoreTimeout = 30 * time.Second
+
+// BranchConfig holds per-snapshot runtime environment, service, and gateway
+// provider settings passed to restored branch VMs.
+type BranchConfig struct {
+	Services  []types.ServiceSpec
+	Env       []string
+	Providers []types.ProviderSpec
+}
+
+func defaultBranchConfig() BranchConfig {
+	return BranchConfig{
+		Services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}},
+	}
+}
+
+func branchConfigFromMeta(meta types.GoldenMeta) BranchConfig {
+	svcs := meta.Services
+	if svcs == nil {
+		svcs = []types.ServiceSpec{}
+	}
+	return BranchConfig{
+		Services:  svcs,
+		Env:       meta.Env,
+		Providers: meta.Providers,
+	}
+}
+
+func hasPostgres(services []types.ServiceSpec) bool {
+	for _, s := range services {
+		if s.Preset == "postgres" || s.Name == "postgres" {
+			return true
+		}
+	}
+	return false
+}
 
 // vm is one Firecracker process running inside a branch netns.
 type vm struct {
@@ -202,16 +236,16 @@ func (g *guest) health(ctx context.Context) (types.HealthResponse, error) {
 	return h, err
 }
 
-// waitReady polls /health until execd is up and Postgres is ready.
+// waitReady polls /health until execd and all configured services report ready.
 func (g *guest) waitReady(ctx context.Context, timeout, interval time.Duration, progress func(time.Duration, error)) error {
 	start := time.Now()
 	for {
 		h, err := g.health(ctx)
-		if err == nil && h.OK && h.PgReady {
+		if err == nil && h.OK && (h.ServicesReady || (h.PgReady && len(h.Services) == 0)) {
 			return nil
 		}
 		if err == nil {
-			err = fmt.Errorf("ok=%t pg_ready=%t", h.OK, h.PgReady)
+			err = fmt.Errorf("ok=%t services_ready=%t pg_ready=%t", h.OK, h.ServicesReady, h.PgReady)
 		}
 		if progress != nil {
 			progress(time.Since(start), err)
@@ -237,8 +271,12 @@ func (g *guest) entropy(ctx context.Context) (types.EntropyResponse, error) {
 }
 
 func (g *guest) sync(ctx context.Context, tgz []byte) error {
+	return g.syncPayload(ctx, "application/gzip", tgz)
+}
+
+func (g *guest) syncPayload(ctx context.Context, contentType string, payload []byte) error {
 	return withTimeout(ctx, 5*time.Minute, func(ctx context.Context) error {
-		_, err := g.do(ctx, http.MethodPost, "/sync", "application/gzip", bytes.NewReader(tgz), nil)
+		_, err := g.do(ctx, http.MethodPost, "/sync", contentType, bytes.NewReader(payload), nil)
 		return err
 	})
 }
@@ -284,12 +322,13 @@ type Branch struct {
 	VM        *vm
 	Guest     *guest
 	RestoreMs int64
+	cfg       BranchConfig
 	gwCancel  context.CancelFunc
 	gwDone    chan error
 
 	// Bench seam. Mode empty means FileRestore. FirstQueryMs runs from
 	// pager setup and LoadSnapshot (or cold boot start) to the first
-	// successful pg_isready round trip.
+	// successful service readiness round trip.
 	Mode          types.RestoreMode
 	FirstQueryMs  int64
 	PrefaultBytes int64
@@ -298,8 +337,13 @@ type Branch struct {
 	pagerErr      chan error
 }
 
-// Sync uploads a workspace tarball to the branch's /workspace.
+// Sync uploads a legacy gzip tarball to the branch's /workspace.
 func (b *Branch) Sync(ctx context.Context, tgz []byte) error { return b.Guest.sync(ctx, tgz) }
+
+// SyncMultipart uploads a multipart delta/full sync payload to /sync.
+func (b *Branch) SyncMultipart(ctx context.Context, contentType string, body []byte) error {
+	return b.Guest.syncPayload(ctx, contentType, body)
+}
 
 // PagerStats reports faults served and bytes copied by the uffd pager.
 func (b *Branch) PagerStats() (faults, bytes int64) {
@@ -334,15 +378,34 @@ func (b *Branch) State(status string) types.BranchState {
 func (b *Branch) Env() []string {
 	gw := "http://" + b.Net.GatewayAddr
 	key := DummyKey(b.Index)
-	return []string{
+	env := make([]string, 0, len(b.cfg.Env)+16+len(b.cfg.Providers)*2)
+	env = append(env, b.cfg.Env...)
+	env = append(env,
 		"HOME=/root",
 		fmt.Sprintf("BRANCH_INDEX=%d", b.Index),
-		"ANTHROPIC_BASE_URL=" + gw + "/" + gateway.ProviderAnthropic,
-		"OPENAI_BASE_URL=" + gw + "/" + gateway.ProviderOpenAI + "/v1",
-		"ANTHROPIC_API_KEY=" + key,
-		"OPENAI_API_KEY=" + key,
-		"DATABASE_URL=" + databaseURL,
+		"ANTHROPIC_BASE_URL="+gw+"/"+gateway.ProviderAnthropic,
+		"OPENAI_BASE_URL="+gw+"/"+gateway.ProviderOpenAI+"/v1",
+		"OPENROUTER_BASE_URL="+gw+"/"+gateway.ProviderOpenRouter+"/v1",
+		"ANTHROPIC_API_KEY="+key,
+		"ANTHROPIC_AUTH_TOKEN="+key,
+		"OPENAI_API_KEY="+key,
+		"CODEX_API_KEY="+key,
+		"OPENROUTER_API_KEY="+key,
+		"IS_SANDBOX=1",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+		"DISABLE_TELEMETRY=1",
+		"DISABLE_ERROR_REPORTING=1",
+		"DISABLE_AUTOUPDATER=1",
+	)
+	for _, p := range b.cfg.Providers {
+		if p.BaseURLEnv != "" {
+			env = append(env, p.BaseURLEnv+"="+gw+"/"+p.Name)
+		}
+		if p.KeyEnv != "" {
+			env = append(env, p.KeyEnv+"="+key)
+		}
 	}
+	return env
 }
 
 // Exec runs argv in the branch with the branch environment.
@@ -362,19 +425,18 @@ func (b *Branch) MemMB() int64 {
 	return mb
 }
 
-// launchBranch builds branch i of runID and restores the golden snapshot
-// into it. On failure every partial resource is removed.
-func launchBranch(ctx context.Context, runID string, i int, memMB int64, record func(types.BranchState)) (*Branch, error) {
-	return LaunchBranch(ctx, runID, i, memMB, types.FileRestore, record)
+// LaunchBranch builds branch i of runID and restores the golden snapshot
+// into it using default BranchConfig. The bench drives all restore modes here.
+func LaunchBranch(ctx context.Context, runID string, i int, memMB int64, mode types.RestoreMode, record func(types.BranchState)) (*Branch, error) {
+	return LaunchBranchConfigured(ctx, runID, i, memMB, mode, defaultBranchConfig(), record)
 }
 
-// LaunchBranch is launchBranch with an explicit restore mode: cold boot,
-// File, PrefaultRestore, or Uffd. The bench drives every mode through it.
-func LaunchBranch(ctx context.Context, runID string, i int, memMB int64, mode types.RestoreMode, record func(types.BranchState)) (*Branch, error) {
+// LaunchBranchConfigured builds branch i with an explicit BranchConfig.
+func LaunchBranchConfigured(ctx context.Context, runID string, i int, memMB int64, mode types.RestoreMode, cfg BranchConfig, record func(types.BranchState)) (*Branch, error) {
 	if i < 1 || i > maxBranches {
 		return nil, fmt.Errorf("branch index %d outside 1..%d", i, maxBranches)
 	}
-	b := &Branch{RunID: runID, Index: i, Dir: cloneDir(runID, i), Mode: mode}
+	b := &Branch{RunID: runID, Index: i, Dir: cloneDir(runID, i), Mode: mode, cfg: cfg}
 	record(b.State(StatusStarting))
 	if err := b.launch(ctx, memMB, record); err != nil {
 		if terr := b.Teardown(); terr != nil {
@@ -440,15 +502,16 @@ func (b *Branch) restore(ctx context.Context) error {
 		return err
 	}
 	b.RestoreMs = time.Since(ready).Milliseconds()
-	if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
-		return err
+	if hasPostgres(b.cfg.Services) {
+		if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
+			return err
+		}
 	}
 	b.FirstQueryMs = time.Since(load).Milliseconds()
 	return nil
 }
 
-// bootColdReady boots the clone's kernel from scratch, the path init
-// takes for the golden VM, and waits for a live Postgres.
+// bootColdReady boots the clone's kernel from scratch and waits for ready.
 func (b *Branch) bootColdReady(ctx context.Context, start time.Time) error {
 	if err := b.VM.bootCold(b.memMB, coldVCPUs, b.Net.TapName); err != nil {
 		return err
@@ -458,16 +521,16 @@ func (b *Branch) bootColdReady(ctx context.Context, start time.Time) error {
 		return fmt.Errorf("cold boot: %w", err)
 	}
 	b.RestoreMs = time.Since(start).Milliseconds()
-	if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
-		return err
+	if hasPostgres(b.cfg.Services) {
+		if err := b.waitPostgres(ctx, pgReadyTimeout()); err != nil {
+			return err
+		}
 	}
 	b.FirstQueryMs = time.Since(start).Milliseconds()
 	return nil
 }
 
-// memBackend prepares guest memory for b.Mode. The uffd pager lives in a
-// goroutine of this process for the VM's lifetime and stops in Teardown;
-// BranchState.PagerPID stays 0 because there is no separate process.
+// memBackend prepares guest memory for b.Mode.
 func (b *Branch) memBackend(ctx context.Context) (fcclient.MemBackend, error) {
 	file := fcclient.MemBackend{BackendType: fcclient.BackendFile, BackendPath: memFile()}
 	switch b.Mode {
@@ -495,8 +558,6 @@ func (b *Branch) memBackend(ctx context.Context) (fcclient.MemBackend, error) {
 	return file, fmt.Errorf("unknown restore mode %q", b.Mode)
 }
 
-// awaitPager surfaces a failed uffd handshake instead of a guest that
-// hangs on its first page fault until restoreTimeout.
 func (b *Branch) awaitPager() error {
 	if b.pager == nil {
 		return nil
@@ -512,11 +573,6 @@ func (b *Branch) awaitPager() error {
 	}
 }
 
-// waitPostgres proves the restored Postgres accepts connections. The
-// snapshot's /health pg_ready flag is memory state from before the pause,
-// so only a live pg_isready inside the guest counts.
-// pgReadyTimeout scales the Postgres barrier with the restore cap, so a
-// bench that allows a long cold-restore stampede does not trip a fixed limit.
 func pgReadyTimeout() time.Duration {
 	if RestoreTimeout > 60*time.Second {
 		return RestoreTimeout
@@ -524,11 +580,15 @@ func pgReadyTimeout() time.Duration {
 	return 60 * time.Second
 }
 
+func pgReadyCmd() []string {
+	return []string{"pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-t", "2"}
+}
+
 func (b *Branch) waitPostgres(ctx context.Context, timeout time.Duration) error {
 	start := time.Now()
 	for {
 		res, err := b.Guest.exec(ctx, types.ExecRequest{
-			Cmd: []string{"pg_isready", "-h", "127.0.0.1", "-t", "2"}, TimeoutSec: 5,
+			Cmd: pgReadyCmd(), TimeoutSec: 5,
 		})
 		if err == nil && res.ExitCode == 0 {
 			return nil
@@ -545,11 +605,22 @@ func (b *Branch) waitPostgres(ctx context.Context, timeout time.Duration) error 
 }
 
 func (b *Branch) startGateway() error {
+	var extras []gateway.ProviderRoute
+	for _, p := range b.cfg.Providers {
+		extras = append(extras, gateway.ProviderRoute{
+			Name:       p.Name,
+			Upstream:   p.Upstream,
+			Key:        os.Getenv(p.APIKeyEnv),
+			AuthHeader: p.AuthHeader,
+		})
+	}
 	gw, err := gateway.New(gateway.Config{
-		ListenAddr:   b.Net.GatewayAddr,
-		BranchKey:    DummyKey(b.Index),
-		AnthropicKey: os.Getenv("ANTHROPIC_API_KEY"),
-		OpenAIKey:    os.Getenv("OPENAI_API_KEY"),
+		ListenAddr:     b.Net.GatewayAddr,
+		BranchKey:      DummyKey(b.Index),
+		AnthropicKey:   os.Getenv("ANTHROPIC_API_KEY"),
+		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
+		OpenRouterKey:  os.Getenv("OPENROUTER_API_KEY"),
+		ExtraProviders: extras,
 	})
 	if err != nil {
 		return fmt.Errorf("gateway: %w", err)
@@ -594,8 +665,6 @@ func (b *Branch) Teardown() error {
 	return errors.Join(perr, teardownState(b.State("")))
 }
 
-// teardownState removes one branch's resources from its saved state. It is
-// idempotent and safe to call from a process that did not launch the branch.
 func teardownState(b types.BranchState) error {
 	ops := cgroup.HostOps{}
 	if isFirecracker(b.FirecrackerPID) {
@@ -618,7 +687,6 @@ func teardownState(b types.BranchState) error {
 	return nil
 }
 
-// procInfo parses /proc/<pid>/stat: "pid (comm) state ...".
 func procInfo(pid int) (comm string, state byte, ok bool) {
 	if pid <= 0 {
 		return "", 0, false
@@ -634,7 +702,6 @@ func procInfo(pid int) (comm string, state byte, ok bool) {
 	return string(raw[open+1 : end]), raw[end+2], true
 }
 
-// isFirecracker guards every kill against PID reuse and ignores zombies.
 func isFirecracker(pid int) bool {
 	comm, state, ok := procInfo(pid)
 	return ok && comm == "firecracker" && state != 'Z'
