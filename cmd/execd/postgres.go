@@ -42,6 +42,7 @@ func (a *agent) postgresCred() (*syscall.Credential, string, error) {
 	}
 	a.credMu.Lock()
 	a.pgCred = cred
+	a.pgHome = home
 	a.credMu.Unlock()
 	return cred, home, nil
 }
@@ -50,12 +51,12 @@ func pgEnv(home string) []string {
 	return []string{basePATH, "HOME=" + home, "LANG=C.UTF-8", "PGHOST=" + pgRunDir, "PGPORT=" + pgPort}
 }
 
-func discoverPostgres() (binDir, dataDir, confFile string, err error) {
+func discoverPostgres(imageEnv []string) (binDir, dataDir, confFile string, err error) {
 	binDir, err = findPgBinDir()
 	if err != nil {
 		return "", "", "", err
 	}
-	dataDir, confFile = findPgDataAndConf()
+	dataDir, confFile = findPgDataAndConf(imageEnv)
 	return binDir, dataDir, confFile, nil
 }
 
@@ -84,7 +85,18 @@ func pgVerFromPath(p string) int {
 	return n
 }
 
-func findPgDataAndConf() (dataDir, confFile string) {
+func extractEnvVal(env []string, key string) string {
+	prefix := key + "="
+	var val string
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, prefix); ok {
+			val = v
+		}
+	}
+	return val
+}
+
+func findPgDataAndConf(imageEnv []string) (dataDir, confFile string) {
 	matches, _ := filepath.Glob("/var/lib/postgresql/*/main/PG_VERSION")
 	sort.Slice(matches, func(i, j int) bool {
 		return pgVerFromPath(matches[i]) > pgVerFromPath(matches[j])
@@ -98,15 +110,21 @@ func findPgDataAndConf() (dataDir, confFile string) {
 		}
 		return dd, ""
 	}
+	if envData := extractEnvVal(imageEnv, "PGDATA"); envData != "" {
+		return envData, ""
+	}
 	if envData := os.Getenv("PGDATA"); envData != "" {
 		return envData, ""
 	}
 	return "/var/lib/postgresql/data", ""
 }
 
-func ensurePgInitialized(binDir, dataDir string, cred *syscall.Credential, home string, procs *procTable) error {
+func ensurePgInitialized(binDir, dataDir string, cred *syscall.Credential, env []string, procs *procTable) error {
 	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); err == nil {
 		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dataDir), 0o755); err != nil {
+		return fmt.Errorf("create pgdata parent %s: %w", filepath.Dir(dataDir), err)
 	}
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("create pgdata %s: %w", dataDir, err)
@@ -117,7 +135,7 @@ func ensurePgInitialized(binDir, dataDir string, cred *syscall.Credential, home 
 	initdb := filepath.Join(binDir, "initdb")
 	cmd := exec.Command(initdb, "-D", dataDir, "--auth=trust", "--encoding=UTF8", "-U", pgUser)
 	cmd.Dir = "/"
-	cmd.Env = pgEnv(home)
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -126,12 +144,49 @@ func ensurePgInitialized(binDir, dataDir string, cred *syscall.Credential, home 
 	}
 	confPath := filepath.Join(dataDir, "postgresql.conf")
 	if f, err := os.OpenFile(confPath, os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-		_, _ = f.WriteString("\nlisten_addresses = '127.0.0.1'\nport = 5432\nssl = off\n")
+		_, _ = f.WriteString("\nlisten_addresses = '127.0.0.1'\nport = 5432\nssl = off\nunix_socket_directories = '/run/postgresql'\n")
 		_ = f.Close()
 	}
 	hba := "local all postgres trust\nlocal all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n"
 	_ = os.WriteFile(filepath.Join(dataDir, "pg_hba.conf"), []byte(hba), 0o600)
 	_ = os.Chown(filepath.Join(dataDir, "pg_hba.conf"), int(cred.Uid), int(cred.Gid))
+	return nil
+}
+
+func ensurePgTrustHBA(confFile, dataDir string, cred *syscall.Credential) error {
+	hbaDir := dataDir
+	if confFile != "" {
+		hbaDir = filepath.Dir(confFile)
+	}
+	hbaPath := filepath.Join(hbaDir, "pg_hba.conf")
+	raw, err := os.ReadFile(hbaPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read %s: %w", hbaPath, err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			line = line[:idx]
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && fields[3] == "127.0.0.1/32" && fields[4] == "trust" {
+			return nil
+		}
+	}
+	const trustRules = "local all postgres trust\nlocal all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n"
+	if err := os.WriteFile(hbaPath, []byte(trustRules+string(raw)), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", hbaPath, err)
+	}
+	if err := os.Chmod(hbaPath, 0o600); err != nil {
+		return fmt.Errorf("chmod %s: %w", hbaPath, err)
+	}
+	if cred != nil {
+		if err := os.Chown(hbaPath, int(cred.Uid), int(cred.Gid)); err != nil {
+			return fmt.Errorf("chown %s: %w", hbaPath, err)
+		}
+	}
 	return nil
 }
 
@@ -158,12 +213,17 @@ func (a *agent) runPostgres(svcName string) {
 		a.fail("postgres", err)
 		return
 	}
-	binDir, dataDir, confFile, err := discoverPostgres()
+	binDir, dataDir, confFile, err := discoverPostgres(a.imageEnv)
 	if err != nil {
 		a.fail("postgres", err)
 		return
 	}
-	if err := ensurePgInitialized(binDir, dataDir, cred, home, a.procs); err != nil {
+	env := a.mergeEnv(pgEnv(home))
+	if err := ensurePgInitialized(binDir, dataDir, cred, env, a.procs); err != nil {
+		a.fail("postgres", err)
+		return
+	}
+	if err := ensurePgTrustHBA(confFile, dataDir, cred); err != nil {
 		a.fail("postgres", err)
 		return
 	}
@@ -172,18 +232,19 @@ func (a *agent) runPostgres(svcName string) {
 		return
 	}
 	a.credMu.Lock()
+	a.pgHome = home
 	a.pgBinDir = binDir
 	a.pgDataDir = dataDir
 	a.pgConfFile = confFile
 	a.credMu.Unlock()
 
-	args := []string{"-D", dataDir, "-c", "listen_addresses=" + pgHost, "-c", "port=" + pgPort}
+	args := []string{"-D", dataDir, "-c", "listen_addresses=" + pgHost, "-c", "port=" + pgPort, "-c", "unix_socket_directories=" + pgRunDir}
 	if confFile != "" {
 		args = append(args, "-c", "config_file="+confFile)
 	}
 	cmd := exec.Command(filepath.Join(binDir, "postgres"), args...)
 	cmd.Dir = "/"
-	cmd.Env = pgEnv(home)
+	cmd.Env = env
 	cmd.Stdout, cmd.Stderr = logOut, logOut
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred, Setsid: true}
 	if err := a.procs.start(cmd); err != nil {
@@ -233,7 +294,7 @@ func (a *agent) pgIsReady(binDir string, cred *syscall.Credential, home string) 
 	ctx, cancel := context.WithTimeout(context.Background(), pgProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, filepath.Join(binDir, "pg_isready"), "-q", "-h", pgHost, "-p", pgPort)
-	cmd.Env = pgEnv(home)
+	cmd.Env = a.mergeEnv(pgEnv(home))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	return a.procs.run(cmd) == nil
 }
@@ -254,7 +315,7 @@ func (a *agent) checkpointPostgres(parent context.Context) error {
 		return errors.New("checkpoint: postgres is not running")
 	}
 	a.credMu.Lock()
-	cred, binDir := a.pgCred, a.pgBinDir
+	cred, binDir, home := a.pgCred, a.pgBinDir, a.pgHome
 	a.credMu.Unlock()
 	if cred == nil || binDir == "" {
 		return errors.New("checkpoint: postgres credentials unknown")
@@ -264,7 +325,7 @@ func (a *agent) checkpointPostgres(parent context.Context) error {
 	cmd := exec.CommandContext(ctx, filepath.Join(binDir, "psql"), "-X", "-q", "-A", "-t",
 		"-v", "ON_ERROR_STOP=1", "-h", pgRunDir, "-p", pgPort, "-U", pgUser, "-d", "postgres",
 		"-c", "CHECKPOINT", "-c", terminateIdle)
-	cmd.Env = pgEnv("/var/lib/postgresql")
+	cmd.Env = a.mergeEnv(pgEnv(home))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

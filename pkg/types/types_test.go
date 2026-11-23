@@ -18,6 +18,7 @@ func TestPTYFrameRoundtrip(t *testing.T) {
 		{"empty", PTYFrameData, nil},
 		{"resize", PTYFrameResize, []byte{0, 40, 0, 120}},
 		{"exit", PTYFrameExit, []byte{0, 0, 0, 2}},
+		{"eof", PTYFrameEOF, nil},
 		{"max", PTYFrameData, bytes.Repeat([]byte("a"), PTYMaxFrameBytes)},
 	}
 	for _, tc := range cases {

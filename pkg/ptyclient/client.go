@@ -115,9 +115,8 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 					}
 				}
 				if rerr != nil {
-					if errors.Is(rerr, io.EOF) && len(req.Cmd) == 0 {
-						// Non-TTY stdin pipe closed; send EOT to interactive shell.
-						_ = sendFrame(types.PTYFrameData, []byte{4})
+					if errors.Is(rerr, io.EOF) {
+						_ = sendFrame(types.PTYFrameEOF, nil)
 					}
 					return
 				}
@@ -131,7 +130,7 @@ func Attach(ctx context.Context, guestAPIAddr string, req types.PTYRequest, stdi
 		kind, data, err := types.ReadPTYFrame(br)
 		if err != nil {
 			if sessionCtx.Err() != nil {
-				return exitCode, nil
+				return 1, sessionCtx.Err()
 			}
 			if errors.Is(err, io.EOF) && !gotExit {
 				return 1, fmt.Errorf("pty connection closed before exit: %w", io.ErrUnexpectedEOF)

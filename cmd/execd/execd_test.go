@@ -9,6 +9,7 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -273,5 +274,290 @@ func TestHandlePTYExitsWithBackgroundChild(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestTwoPhaseCustomServiceBoot(t *testing.T) {
+	ws := t.TempDir()
+	marker := filepath.Join(ws, "custom.started")
+	a := &agent{
+		procs: newProcTable(),
+		services: []types.ServiceSpec{
+			{Name: "web", Cmd: []string{"sh", "-c", fmt.Sprintf("touch %q && sleep 5", marker)}},
+		},
+		svcState: map[string]bool{},
+		svcDead:  map[string]bool{},
+		wsDir:    ws,
+	}
+	a.runServices()
+
+	if !a.presetsReady.Load() || !a.pgReady.Load() {
+		t.Fatalf("expected presetsReady and pgReady true before custom start, got presets=%t pg=%t", a.presetsReady.Load(), a.pgReady.Load())
+	}
+	if a.servicesReady.Load() {
+		t.Fatalf("expected servicesReady false before /services/start")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("custom service ran before /services/start: err=%v", err)
+	}
+
+	h := a.routes()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var hr types.HealthResponse
+	if err := json.NewDecoder(rec.Body).Decode(&hr); err != nil {
+		t.Fatalf("decode health: %v", err)
+	}
+	if !hr.PresetsReady || hr.ServicesReady || hr.Version != execdVersion {
+		t.Fatalf("health = %+v, want presets_ready=true services_ready=false version=%q", hr, execdVersion)
+	}
+
+	startReq := httptest.NewRequest(http.MethodPost, "/services/start", nil)
+	startRec := httptest.NewRecorder()
+	h.ServeHTTP(startRec, startReq)
+	if startRec.Code != http.StatusOK {
+		t.Fatalf("POST /services/start status = %d, want 200", startRec.Code)
+	}
+
+	// Second call must be idempotent.
+	startRec2 := httptest.NewRecorder()
+	h.ServeHTTP(startRec2, httptest.NewRequest(http.MethodPost, "/services/start", nil))
+	if startRec2.Code != http.StatusOK {
+		t.Fatalf("second POST /services/start status = %d, want 200", startRec2.Code)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if a.servicesReady.Load() {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !a.servicesReady.Load() {
+		t.Fatalf("custom service did not become ready after /services/start (state=%+v)", a.serviceSnapshot())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker file %s missing: %v", marker, err)
+	}
+}
+
+func TestWaitServiceReadyRequiresBothTCPAndCmd(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ws := t.TempDir()
+	flagFile := filepath.Join(ws, "ready.flag")
+	a := &agent{procs: newProcTable(), wsDir: ws}
+	exited := make(chan struct{})
+
+	// TCP is listening, but ReadyCmd fails until flagFile exists.
+	svcFail := types.ServiceSpec{
+		Name:     "both-fail",
+		ReadyTCP: ln.Addr().String(),
+		ReadyCmd: []string{"test", "-f", flagFile},
+	}
+	if err := a.waitServiceReady(svcFail, exited, 400*time.Millisecond); err == nil {
+		t.Fatal("waitServiceReady succeeded even though ReadyCmd failed")
+	}
+
+	if err := os.WriteFile(flagFile, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.waitServiceReady(svcFail, exited, 2*time.Second); err != nil {
+		t.Fatalf("waitServiceReady failed when both TCP and ReadyCmd pass: %v", err)
+	}
+}
+
+func TestHandleRebaseAndDiff(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "app.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{procs: newProcTable(), wsDir: ws}
+	h := a.routes()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/rebase", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /rebase status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var sr syncResponse
+	if err := json.NewDecoder(rec.Body).Decode(&sr); err != nil {
+		t.Fatalf("decode rebase response: %v", err)
+	}
+	if !sr.OK || sr.BaseSHA == "" {
+		t.Fatalf("unexpected rebase response: %+v", sr)
+	}
+
+	if err := os.WriteFile(filepath.Join(ws, "app.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diffRec := httptest.NewRecorder()
+	h.ServeHTTP(diffRec, httptest.NewRequest(http.MethodGet, "/diff", nil))
+	if diffRec.Code != http.StatusOK {
+		t.Fatalf("GET /diff status = %d, body=%s", diffRec.Code, diffRec.Body.String())
+	}
+	if !strings.Contains(diffRec.Body.String(), "+v2") {
+		t.Fatalf("diff missing +v2: %s", diffRec.Body.String())
+	}
+}
+
+func TestHandleProbe(t *testing.T) {
+	a := &agent{procs: newProcTable()}
+	h := a.routes()
+
+	// Local HTTP server checking custom header.
+	targetSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Probe-Token") != "secret" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer targetSrv.Close()
+
+	doProbe := func(req types.ProbeRequest) types.ProbeResponse {
+		body, _ := json.Marshal(req)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/probe", bytes.NewReader(body)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("POST /probe status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var resp types.ProbeResponse
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode probe response: %v", err)
+		}
+		return resp
+	}
+
+	httpResp := doProbe(types.ProbeRequest{
+		Kind:      "http",
+		URL:       targetSrv.URL,
+		HeaderKey: "X-Probe-Token",
+		HeaderVal: "secret",
+	})
+	if !httpResp.OK || httpResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("http probe = %+v, want OK with 204", httpResp)
+	}
+
+	// Closed TCP port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedTCPAddr := ln.Addr().String()
+	_ = ln.Close()
+	tcpResp := doProbe(types.ProbeRequest{Kind: "tcp", Addr: closedTCPAddr, TimeoutMs: 200})
+	if tcpResp.OK || tcpResp.Error == "" {
+		t.Fatalf("closed tcp probe = %+v, want OK=false with error", tcpResp)
+	}
+
+	// Unreachable UDP port.
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedUDPAddr := pc.LocalAddr().String()
+	_ = pc.Close()
+	udpResp := doProbe(types.ProbeRequest{Kind: "udp-dns", Addr: closedUDPAddr, TimeoutMs: 200})
+	if udpResp.OK || udpResp.Error == "" {
+		t.Fatalf("unreachable udp-dns probe = %+v, want OK=false with error", udpResp)
+	}
+}
+
+func TestHandlePTYEOFPipedCat(t *testing.T) {
+	a := &agent{procs: newProcTable()}
+	srv := httptest.NewServer(http.HandlerFunc(a.handlePTY))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	runCat := func(input, wantSubstr string) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+		payload, _ := json.Marshal(types.PTYRequest{Cmd: []string{"cat"}, Dir: t.TempDir()})
+		req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/pty", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "bvm-pty")
+		req.ContentLength = int64(len(payload))
+		if err := req.Write(conn); err != nil {
+			t.Fatal(err)
+		}
+
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("handshake failed: resp=%+v err=%v", resp, err)
+		}
+
+		if err := types.WritePTYFrame(conn, types.PTYFrameData, []byte(input)); err != nil {
+			t.Fatal(err)
+		}
+		if err := types.WritePTYFrame(conn, types.PTYFrameEOF, nil); err != nil {
+			t.Fatal(err)
+		}
+
+		var out bytes.Buffer
+		for {
+			kind, data, err := types.ReadPTYFrame(br)
+			if err != nil {
+				t.Fatalf("ReadPTYFrame: %v (out=%q)", err, out.String())
+			}
+			if kind == types.PTYFrameData {
+				out.Write(data)
+				continue
+			}
+			if kind == types.PTYFrameExit {
+				code := int(int32(binary.BigEndian.Uint32(data)))
+				if code != 0 {
+					t.Fatalf("exit code = %d, want 0 (out=%q)", code, out.String())
+				}
+				if !strings.Contains(out.String(), wantSubstr) {
+					t.Fatalf("output %q missing %q", out.String(), wantSubstr)
+				}
+				return
+			}
+		}
+	}
+
+	runCat("hello\n", "hello")
+	runCat("no-newline", "no-newline")
+}
+
+func TestFindPgDataAndConfFromImageEnv(t *testing.T) {
+	t.Setenv("PGDATA", "/from/process-env")
+	dd, cf := findPgDataAndConf([]string{"FOO=bar", "PGDATA=/from/image-env"})
+	if dd != "/from/image-env" || cf != "" {
+		t.Fatalf("findPgDataAndConf = (%q, %q), want (%q, %q)", dd, cf, "/from/image-env", "")
+	}
+
+	t.Setenv("PGDATA", "")
+	dd, cf = findPgDataAndConf([]string{"FOO=bar"})
+	if dd != "/var/lib/postgresql/data" || cf != "" {
+		t.Fatalf("fallback findPgDataAndConf = (%q, %q), want (%q, %q)", dd, cf, "/var/lib/postgresql/data", "")
+	}
+}
+
+func TestSafeDeleteTargetRejectsIntermediateSymlink(t *testing.T) {
+	outside := t.TempDir()
+	root := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := safeDeleteTarget(root, "link/secret.txt"); err == nil {
+		t.Fatal("expected safeDeleteTarget to reject intermediate symlink")
+	}
+	if _, err := safeDeleteTarget(root, "link"); err != nil {
+		t.Fatalf("unexpected error deleting leaf symlink: %v", err)
 	}
 }
