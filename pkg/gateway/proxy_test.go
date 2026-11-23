@@ -3,11 +3,14 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -343,5 +346,107 @@ func TestBodyCap(t *testing.T) {
 	rec := do(g, http.MethodPost, "/anthropic/v1/messages", map[string]string{"x-api-key": dummyKey}, big)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d, want 413", rec.Code)
+	}
+}
+
+func TestValidateUpstreamIP(t *testing.T) {
+	cases := []struct {
+		name          string
+		addr          netip.Addr
+		allowLoopback bool
+		wantOK        bool
+	}{
+		{"invalid", netip.Addr{}, true, false},
+		{"imds v4 no loopback", netip.MustParseAddr("169.254.169.254"), false, false},
+		{"imds v4 allow loopback", netip.MustParseAddr("169.254.169.254"), true, false},
+		{"imds v4-mapped v6 no loopback", netip.MustParseAddr("::ffff:169.254.169.254"), false, false},
+		{"imds v4-mapped v6 allow loopback", netip.MustParseAddr("::ffff:169.254.169.254"), true, false},
+		{"branchvm net no loopback", netip.MustParseAddr("10.200.2.2"), false, false},
+		{"branchvm net allow loopback", netip.MustParseAddr("10.200.2.2"), true, false},
+		{"unspecified", netip.MustParseAddr("0.0.0.0"), true, false},
+		{"multicast", netip.MustParseAddr("224.0.0.1"), true, false},
+		{"loopback rejected", netip.MustParseAddr("127.0.0.1"), false, false},
+		{"loopback allowed", netip.MustParseAddr("127.0.0.1"), true, true},
+		{"private rejected", netip.MustParseAddr("192.168.1.1"), false, false},
+		{"private allowed", netip.MustParseAddr("192.168.1.1"), true, true},
+		{"public v4 no loopback", netip.MustParseAddr("8.8.8.8"), false, true},
+		{"public v4 allow loopback", netip.MustParseAddr("8.8.8.8"), true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateUpstreamIP(tc.addr, tc.allowLoopback)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("validateUpstreamIP(%v, %v) = %v, wantOK=%v", tc.addr, tc.allowLoopback, err, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestNonHTTPSCustomProviderRejectedWithoutTestFlag(t *testing.T) {
+	if _, err := New(Config{
+		ListenAddr: "10.200.3.1:18080",
+		BranchKey:  dummyKey,
+		ExtraProviders: []ProviderRoute{
+			{Name: "together", Upstream: "http://api.together.xyz/v1", Key: "k"},
+		},
+	}); err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("expected https error, got %v", err)
+	}
+
+	if _, err := New(Config{
+		ListenAddr: "10.200.3.1:18080",
+		BranchKey:  dummyKey,
+		ExtraProviders: []ProviderRoute{
+			{Name: "priv", Upstream: "https://192.168.1.1/v1", Key: "k"},
+		},
+	}); err == nil {
+		t.Fatal("expected private IP upstream rejection when !AllowLoopbackForTest")
+	}
+}
+
+func TestDialTimeBlocksDisallowedIPsEvenWithAllowLoopback(t *testing.T) {
+	g := newTestGateway(t, "http://127.0.0.1:19999", "http://127.0.0.1:19999")
+	tr, ok := g.proxy.Transport.(*http.Transport)
+	if !ok || tr.DialContext == nil {
+		t.Fatal("expected custom *http.Transport with DialContext on proxy")
+	}
+	for _, target := range []string{
+		"10.200.2.2:443",
+		"169.254.169.254:80",
+		"[::ffff:169.254.169.254]:80",
+	} {
+		t.Run(target, func(t *testing.T) {
+			conn, err := tr.DialContext(context.Background(), "tcp", target)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err == nil {
+				t.Fatalf("expected dial to %s to be blocked", target)
+			}
+		})
+	}
+}
+
+func TestListenReturnsImmediateEADDRINUSE(t *testing.T) {
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+
+	g, err := New(Config{
+		ListenAddr:           busy.Addr().String(),
+		AllowLoopbackForTest: true,
+		BranchKey:            dummyKey,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ln, err := g.Listen()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("Listen on busy port err = %v, want EADDRINUSE", err)
 	}
 }

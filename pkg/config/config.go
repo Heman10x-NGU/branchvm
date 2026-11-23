@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -21,38 +22,44 @@ import (
 const FileName = "branchvm.toml"
 
 const (
-	defaultMemMB = 1024
-	defaultVCPUs = 2
-	minMemMB     = 128
-	maxVCPUs     = 32
+	defaultMemMB          = 1024
+	defaultVCPUs          = 2
+	defaultWarmTimeoutSec = 1800
+	minMemMB              = 128
+	maxVCPUs              = 32
 )
 
 var (
-	dbNameRe   = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$`)
-	provNameRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
-	envNameRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	dbNameRe    = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]{0,62}$`)
+	provNameRe  = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+	envNameRe   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	branchvmNet = netip.MustParsePrefix("10.200.0.0/16")
 )
 
 // Config holds branchvm configuration for a repository.
 type Config struct {
-	Image        string
-	Dockerfile   string
-	RootfsSizeMB int64
-	MemMB        int64
-	VCPUs        int
-	Warm         string
-	Database     string
-	Env          []string
-	Services     []types.ServiceSpec
-	Providers    []types.ProviderSpec
+	Image          string
+	Dockerfile     string
+	RootfsSizeMB   int64
+	MemMB          int64
+	VCPUs          int
+	Warm           string
+	WarmTimeoutSec int
+	Database       string
+	Env            []string
+	Services       []types.ServiceSpec
+	Providers      []types.ProviderSpec
 }
 
 // DefaultConfig returns the v0.1 defaults used when no branchvm.toml exists.
 func DefaultConfig() Config {
 	return Config{
-		MemMB:    defaultMemMB,
-		VCPUs:    defaultVCPUs,
-		Services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}},
+		MemMB:          defaultMemMB,
+		VCPUs:          defaultVCPUs,
+		WarmTimeoutSec: defaultWarmTimeoutSec,
+		Database:       "authdemo",
+		Env:            []string{"DATABASE_URL=postgres://postgres@127.0.0.1:5432/authdemo?sslmode=disable"},
+		Services:       []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}},
 	}
 }
 
@@ -81,9 +88,10 @@ func Parse(data []byte) (Config, error) {
 	p := &parser{
 		src: strings.ReplaceAll(string(data), "\r\n", "\n"),
 		cfg: Config{
-			MemMB:    defaultMemMB,
-			VCPUs:    defaultVCPUs,
-			Services: []types.ServiceSpec{},
+			MemMB:          defaultMemMB,
+			VCPUs:          defaultVCPUs,
+			WarmTimeoutSec: defaultWarmTimeoutSec,
+			Services:       []types.ServiceSpec{},
 		},
 		topSeen: map[string]bool{},
 		provIdx: map[string]int{},
@@ -445,6 +453,13 @@ func (p *parser) assignTop(line int, key string, v parsedVal) error {
 		return nil
 	case "warm":
 		return needString(line, key, v, &p.cfg.Warm)
+	case "warm_timeout_sec":
+		var n int64
+		if err := needInt64(line, key, v, &n); err != nil {
+			return err
+		}
+		p.cfg.WarmTimeoutSec = int(n)
+		return nil
 	case "database":
 		return needString(line, key, v, &p.cfg.Database)
 	case "env":
@@ -636,6 +651,9 @@ func validate(cfg *Config) error {
 	if cfg.VCPUs < 1 || cfg.VCPUs > maxVCPUs {
 		return fmt.Errorf("cpus must be between 1 and %d, got %d", maxVCPUs, cfg.VCPUs)
 	}
+	if cfg.WarmTimeoutSec < 0 {
+		return fmt.Errorf("warm_timeout_sec must be >= 0, got %d", cfg.WarmTimeoutSec)
+	}
 	if cfg.Database != "" && !dbNameRe.MatchString(cfg.Database) {
 		return fmt.Errorf("invalid database name %q", cfg.Database)
 	}
@@ -643,6 +661,7 @@ func validate(cfg *Config) error {
 		return err
 	}
 	seenSvc := map[string]bool{}
+	hasPostgres := false
 	for _, s := range cfg.Services {
 		if s.Name == "" {
 			return errors.New("service name must not be empty")
@@ -651,8 +670,19 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate service %q", s.Name)
 		}
 		seenSvc[s.Name] = true
-		if s.Preset == "" && len(s.Cmd) == 0 {
-			return fmt.Errorf("service %q: cmd must not be empty", s.Name)
+		if s.Preset == "postgres" {
+			hasPostgres = true
+		}
+		if s.Preset == "" {
+			if len(s.Cmd) == 0 || strings.TrimSpace(s.Cmd[0]) == "" {
+				return fmt.Errorf("service %q: cmd must not be empty", s.Name)
+			}
+			if len(s.ReadyCmd) > 0 && strings.TrimSpace(s.ReadyCmd[0]) == "" {
+				return fmt.Errorf("service %q: ready_cmd[0] must not be empty", s.Name)
+			}
+			if len(s.CheckpointCmd) > 0 && strings.TrimSpace(s.CheckpointCmd[0]) == "" {
+				return fmt.Errorf("service %q: checkpoint_cmd[0] must not be empty", s.Name)
+			}
 		}
 		if s.ReadyTimeoutSec < 0 {
 			return fmt.Errorf("service %q: ready_timeout_sec must be >= 0", s.Name)
@@ -666,13 +696,32 @@ func validate(cfg *Config) error {
 			return err
 		}
 	}
+	if cfg.Database != "" && !hasPostgres {
+		return fmt.Errorf("database %q requires \"postgres\" in services", cfg.Database)
+	}
 	for _, pr := range cfg.Providers {
+		switch pr.Name {
+		case "anthropic", "openai", "openrouter":
+			return fmt.Errorf("provider %q: built-in provider cannot be overridden in %s", pr.Name, FileName)
+		}
 		if pr.Upstream == "" {
 			return fmt.Errorf("provider %q: upstream is required", pr.Name)
 		}
 		u, err := url.Parse(pr.Upstream)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("provider %q: invalid upstream URL %q", pr.Name, pr.Upstream)
+		}
+		if u.Scheme != "https" {
+			return fmt.Errorf("provider %q: upstream %q must use https", pr.Name, pr.Upstream)
+		}
+		if addr, err := netip.ParseAddr(u.Hostname()); err == nil {
+			addr = addr.Unmap()
+			if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
+				addr.IsLoopback() || addr.IsPrivate() ||
+				addr.IsUnspecified() || addr.IsMulticast() ||
+				branchvmNet.Contains(addr) {
+				return fmt.Errorf("provider %q: upstream IP %s is not allowed", pr.Name, addr)
+			}
 		}
 		if !envNameRe.MatchString(pr.APIKeyEnv) {
 			return fmt.Errorf("provider %q: invalid api_key_env %q", pr.Name, pr.APIKeyEnv)

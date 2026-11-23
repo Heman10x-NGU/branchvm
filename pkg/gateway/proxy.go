@@ -16,12 +16,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+var branchvmNet = netip.MustParsePrefix("10.200.0.0/16")
 
 // MaxBodyBytes caps the request body forwarded upstream.
 const MaxBodyBytes = 25 << 20
@@ -108,12 +111,15 @@ func New(cfg Config) (*Gateway, error) {
 		ProviderOpenAI:     cfg.OpenAIKey,
 		ProviderOpenRouter: cfg.OpenRouterKey,
 	}
+	requireHTTPS := !cfg.AllowLoopbackForTest
+	allowLoopback := cfg.AllowLoopbackForTest
+
 	for name, spec := range defaultUpstreams {
 		raw := spec.upstream
 		if o, ok := cfg.Upstreams[name]; ok {
 			raw = o
 		}
-		u, err := parseUpstreamURL(name, raw)
+		u, err := parseUpstreamURL(name, raw, requireHTTPS, allowLoopback)
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +133,7 @@ func New(cfg Config) (*Gateway, error) {
 		if _, dup := routes[ep.Name]; dup {
 			return nil, fmt.Errorf("gateway: duplicate provider route %q", ep.Name)
 		}
-		u, err := parseUpstreamURL(ep.Name, ep.Upstream)
+		u, err := parseUpstreamURL(ep.Name, ep.Upstream, requireHTTPS, allowLoopback)
 		if err != nil {
 			return nil, err
 		}
@@ -148,8 +154,48 @@ func New(cfg Config) (*Gateway, error) {
 	sort.Strings(names)
 
 	g := &Gateway{cfg: cfg, routes: routes, routeNames: names}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		var ips []netip.Addr
+		if ip, err := netip.ParseAddr(host); err == nil {
+			ips = []netip.Addr{ip}
+		} else {
+			ips, err = net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("gateway: no IP addresses resolved for %q", host)
+			}
+		}
+		for _, ip := range ips {
+			if err := validateUpstreamIP(ip, cfg.AllowLoopbackForTest); err != nil {
+				return nil, fmt.Errorf("gateway: blocked upstream %s (%s): %w", host, ip.Unmap(), err)
+			}
+		}
+		var lastErr error
+		for _, ip := range ips {
+			target := net.JoinHostPort(ip.Unmap().String(), port)
+			conn, err := dialer.DialContext(ctx, network, target)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	}
+
 	g.proxy = &httputil.ReverseProxy{
 		Rewrite:       g.rewrite,
+		Transport:     transport,
 		FlushInterval: -1,
 		ErrorHandler:  proxyError,
 		ErrorLog:      log.New(io.Discard, "", 0),
@@ -157,7 +203,35 @@ func New(cfg Config) (*Gateway, error) {
 	return g, nil
 }
 
-func parseUpstreamURL(name, raw string) (*url.URL, error) {
+func validateUpstreamIP(addr netip.Addr, allowLoopback bool) error {
+	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return errors.New("invalid IP address")
+	}
+	if addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() {
+		return fmt.Errorf("link-local address %s is not allowed", addr)
+	}
+	if addr.IsUnspecified() {
+		return fmt.Errorf("unspecified address %s is not allowed", addr)
+	}
+	if addr.IsMulticast() {
+		return fmt.Errorf("multicast address %s is not allowed", addr)
+	}
+	if branchvmNet.Contains(addr) {
+		return fmt.Errorf("branchvm internal address %s is not allowed", addr)
+	}
+	if !allowLoopback {
+		if addr.IsLoopback() {
+			return fmt.Errorf("loopback address %s is not allowed", addr)
+		}
+		if addr.IsPrivate() {
+			return fmt.Errorf("private address %s is not allowed", addr)
+		}
+	}
+	return nil
+}
+
+func parseUpstreamURL(name, raw string, requireHTTPS, allowLoopback bool) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("gateway: upstream %s: %w", name, err)
@@ -165,8 +239,13 @@ func parseUpstreamURL(name, raw string) (*url.URL, error) {
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("gateway: upstream %s: must be http(s) URL with host", name)
 	}
-	if ip := net.ParseIP(u.Hostname()); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
-		return nil, fmt.Errorf("gateway: upstream %s: link-local address %s is not allowed", name, u.Hostname())
+	if requireHTTPS && u.Scheme != "https" {
+		return nil, fmt.Errorf("gateway: upstream %s: scheme %q must be https", name, u.Scheme)
+	}
+	if addr, err := netip.ParseAddr(u.Hostname()); err == nil {
+		if err := validateUpstreamIP(addr, allowLoopback); err != nil {
+			return nil, fmt.Errorf("gateway: upstream %s: %w", name, err)
+		}
 	}
 	return u, nil
 }
@@ -195,12 +274,17 @@ func validateListenAddr(addr string, allowLoopback bool) error {
 	return nil
 }
 
-// Serve listens on cfg.ListenAddr until ctx is done.
-func (g *Gateway) Serve(ctx context.Context) error {
+// Listen binds g.cfg.ListenAddr and returns the listener.
+func (g *Gateway) Listen() (net.Listener, error) {
 	ln, err := net.Listen("tcp", g.cfg.ListenAddr)
 	if err != nil {
-		return fmt.Errorf("gateway: listen: %w", err)
+		return nil, fmt.Errorf("gateway: listen: %w", err)
 	}
+	return ln, nil
+}
+
+// ServeListener serves HTTP on ln until ctx is done, then shuts down gracefully.
+func (g *Gateway) ServeListener(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           g,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -214,12 +298,21 @@ func (g *Gateway) Serve(ctx context.Context) error {
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
-	err = srv.Serve(ln)
+	err := srv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		<-done
 		return nil
 	}
 	return fmt.Errorf("gateway: serve: %w", err)
+}
+
+// Serve listens on cfg.ListenAddr until ctx is done.
+func (g *Gateway) Serve(ctx context.Context) error {
+	ln, err := g.Listen()
+	if err != nil {
+		return err
+	}
+	return g.ServeListener(ctx, ln)
 }
 
 // ServeHTTP authenticates, routes, and proxies one request.
