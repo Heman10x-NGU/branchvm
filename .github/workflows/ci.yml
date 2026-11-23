@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet host and cross targets
+        run: |
+          go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
+          GOOS=linux GOARCH=amd64 go vet ./...
+          GOOS=linux GOARCH=arm64 go vet ./...
+
+      - name: Run tests
+        run: go test -race -count=1 ./...
+
+      - name: Build static Linux binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/branchvm
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/execd
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/branchvm
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/execd
+
+      - name: Check shell scripts and formatting
+        run: |
+          sh -n scripts/install.sh
+          unformatted="$(gofmt -l cmd pkg)"
+          if [ -n "$unformatted" ]; then
+            echo "Files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi

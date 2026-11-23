@@ -21,7 +21,7 @@ func cmdRun(ctx context.Context, args []string) error {
 	repo := fs.String("repo", "", "git repo to sync into each branch (default: current dir)")
 	mem := fs.Int64("mem", 1024, "guest memory in MiB (default: inherited from init; cgroup adds 256 MiB headroom)")
 	timeout := fs.Int("timeout", 600, "per-branch command timeout in seconds")
-	pager := fs.String("pager", "mmap", "snapshot memory pager: mmap, fadvise, or uffd")
+	pager := fs.String("pager", "mmap", "snapshot memory pager: mmap or fadvise")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -61,8 +61,8 @@ func parsePager(name string) (types.RestoreMode, error) {
 	case "fadvise", "prefault":
 		return pool.PrefaultRestore, nil
 	case "uffd":
-		return types.UffdRestore, nil
+		return "", errors.New("uffd pager runs in-process and is only supported in `branchvm bench`; use mmap or fadvise")
 	default:
-		return "", fmt.Errorf("unknown --pager %q (want mmap, fadvise, or uffd)", name)
+		return "", fmt.Errorf("unknown --pager %q (want mmap or fadvise)", name)
 	}
 }

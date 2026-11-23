@@ -174,7 +174,7 @@ sudo ../../bin/branchvm gc --all
 ```bash
 sudo scripts/build-rootfs.sh   # optional: builds base Ubuntu + Go + Postgres rootfs
 cd examples/auth-demo
-sudo -E ../../bin/branchvm init --warm 'go test -run ^$ ./...'
+sudo -E ../../bin/branchvm init  # uses warm command in examples/auth-demo/branchvm.toml
 sudo -E ../../bin/branchvm run --branches 3 -- ./demo-agents.sh
 sudo ../../bin/branchvm diff 2 --stat
 sudo ../../bin/branchvm shell 2 -- go test ./...
@@ -192,7 +192,7 @@ sudo -E ../../bin/branchvm init --image branchvm-agent:latest
 sudo -E ../../bin/branchvm run --branches 3 -- claude --dangerously-skip-permissions -p "Fix the failing auth test and verify go test ./..."
 ```
 
-Pass `--pager uffd` or `--pager fadvise` to `branchvm run` to switch away from plain `mmap` restores.
+Pass `--pager fadvise` to `branchvm run` to prefault the recorded working set instead of plain `mmap` restores (`--pager uffd` runs in-process and is supported in `branchvm bench`).
 
 ### Live demo page
 
@@ -243,6 +243,6 @@ Full methodology and all three tables are in [BENCHMARKS.md](BENCHMARKS.md). Eve
 ## Limits
 
 - Requires Linux with KVM (`/dev/kvm`). Firecracker does not run natively on macOS; on an M3 or newer Mac you need the Lima `fc-lab` VM with nested virtualization enabled.
-- The `nftables` firewall drops all outbound traffic except the host LLM gateway (`10.200.i.1:18080` for Anthropic, OpenAI, OpenRouter, and `[providers.*]`). Install project dependencies into your Dockerfile or `--warm` before `branchvm init`, since runtime `npm install` or `pip install` inside a branch cannot reach public registries.
+- The `nftables` firewall drops all outbound traffic except the host LLM gateway (`10.200.i.1:18080` for Anthropic, OpenAI, OpenRouter, and `[providers.*]`). It is active during both `--warm` and branch runs, so install project dependencies in your Dockerfile or vendor them before `branchvm init`, since `npm install` or `pip install` inside a VM cannot reach public registries.
 - Branch IPs are assigned per index, so one run owns the host at a time; `run` refuses to start while another run has live VMs.
 - This is a local developer tool, not multi-tenant production hardening. It runs as root, starts Firecracker without `jailer`, and does not isolate untrusted tenants from each other.

@@ -96,7 +96,7 @@ func WorkingSetPath() string { return wsFile() }
 
 // BenchPreflight runs the checks Init and Run make before touching VMs.
 func BenchPreflight(out io.Writer) error {
-	if err := checkPrereqs(""); err != nil {
+	if err := checkPrereqs("oci"); err != nil {
 		return err
 	}
 	if err := prepareHost(out); err != nil {
@@ -135,19 +135,20 @@ func newRunID() string {
 
 // InitOptions configures Init.
 type InitOptions struct {
-	Repo         string
-	Image        string
-	Dockerfile   string
-	ExecdPath    string
-	RootfsSizeMB int64
-	MemMB        int64
-	VCPUs        int
-	WarmCmd      string
-	Database     string
-	Services     []types.ServiceSpec
-	Env          []string
-	Providers    []types.ProviderSpec
-	Out          io.Writer
+	Repo           string
+	Image          string
+	Dockerfile     string
+	ExecdPath      string
+	RootfsSizeMB   int64
+	MemMB          int64
+	VCPUs          int
+	WarmCmd        string
+	WarmTimeoutSec int
+	Database       string
+	Services       []types.ServiceSpec
+	Env            []string
+	Providers      []types.ProviderSpec
+	Out            io.Writer
 }
 
 // Init builds or selects the rootfs, brings up the XFS pool, cold boots
@@ -199,6 +200,16 @@ func Init(ctx context.Context, opt InitOptions) error {
 	start := time.Now()
 	if err := prepareGoldenDisk(sourceRootfs, opt.Out); err != nil {
 		return err
+	}
+	if mode != "oci" {
+		execdPath, err := rootfs.FindExecd(opt.ExecdPath)
+		if err != nil {
+			return err
+		}
+		if err := rootfs.InjectBaseOverlay(ctx, goldenRootfs(), execdPath, opt.Services); err != nil {
+			return fmt.Errorf("inject base overlay: %w", err)
+		}
+		fmt.Fprintf(opt.Out, "injected execd + services.json into golden rootfs (%s)\n", execdPath)
 	}
 	hostSHA, goldenFiles, err := storage.WorkspaceManifest(opt.Repo)
 	if err != nil {
@@ -328,7 +339,9 @@ func saveGoldenMeta(meta types.GoldenMeta) error {
 	return nil
 }
 
-func loadGoldenMeta() (types.GoldenMeta, bool, error) {
+// LoadGoldenMeta reads golden/meta.json, returning v0.1 defaults with
+// found=false when absent.
+func LoadGoldenMeta() (types.GoldenMeta, bool, error) {
 	raw, err := os.ReadFile(goldenMetaFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return types.GoldenMeta{
@@ -348,6 +361,10 @@ func loadGoldenMeta() (types.GoldenMeta, bool, error) {
 		meta.Services = []types.ServiceSpec{}
 	}
 	return meta, true, nil
+}
+
+func loadGoldenMeta() (types.GoldenMeta, bool, error) {
+	return LoadGoldenMeta()
 }
 
 func bootGolden(ctx context.Context, opt InitOptions) (err error) {
@@ -380,6 +397,15 @@ func bootGolden(ctx context.Context, opt InitOptions) (err error) {
 	return snapshotGolden(ctx, opt, v, newGuest(n.GuestAPIAddr))
 }
 
+func hasCustomServices(services []types.ServiceSpec) bool {
+	for _, s := range services {
+		if s.Preset == "" {
+			return true
+		}
+	}
+	return false
+}
+
 func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error {
 	fmt.Fprintf(opt.Out, "booting golden VM (%s, %d MiB, %d vCPUs), waiting for services\n", KernelPath(), opt.MemMB, opt.VCPUs)
 	last := time.Duration(0)
@@ -389,7 +415,7 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 			fmt.Fprintf(opt.Out, "  %2.0fs: not ready yet (%v)\n", elapsed.Seconds(), cause)
 		}
 	}
-	if err := g.waitReady(ctx, goldenBootTimeout, 500*time.Millisecond, progress); err != nil {
+	if err := g.waitPresetsReady(ctx, goldenBootTimeout, 500*time.Millisecond, progress); err != nil {
 		return fmt.Errorf("golden boot: %w", err)
 	}
 	tgz, err := storage.PackWorkspace(opt.Repo)
@@ -408,8 +434,20 @@ func snapshotGolden(ctx context.Context, opt InitOptions, v *vm, g *guest) error
 			return err
 		}
 	}
+	if hasCustomServices(opt.Services) {
+		fmt.Fprintln(opt.Out, "starting custom services, waiting for readiness")
+		if err := g.startServices(ctx); err != nil {
+			return fmt.Errorf("start custom services: %w", err)
+		}
+		if err := g.waitReady(ctx, goldenBootTimeout, 500*time.Millisecond, progress); err != nil {
+			return fmt.Errorf("golden custom services: %w", err)
+		}
+	}
 	if err := warmGolden(ctx, opt, g); err != nil {
 		return err
+	}
+	if err := g.rebase(ctx); err != nil {
+		return fmt.Errorf("golden rebase: %w", err)
 	}
 	if err := g.checkpoint(ctx); err != nil {
 		return fmt.Errorf("golden checkpoint: %w", err)
@@ -442,10 +480,14 @@ func warmGolden(ctx context.Context, opt InitOptions, g *guest) error {
 	start := time.Now()
 	env := append([]string(nil), opt.Env...)
 	env = append(env, "HOME=/root", "GOTOOLCHAIN=local")
+	timeoutSec := opt.WarmTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 1800
+	}
 	res, err := g.exec(ctx, types.ExecRequest{
 		Cmd:        []string{"sh", "-c", opt.WarmCmd},
 		Env:        env,
-		TimeoutSec: 900,
+		TimeoutSec: timeoutSec,
 	})
 	if err != nil {
 		return fmt.Errorf("warm command: %w", err)
@@ -574,6 +616,9 @@ func buildRunSync(repoDir string, meta types.GoldenMeta, hasMeta bool) (syncUplo
 // each, stores each diff and log, and leaves the VMs running for inspection
 // and apply. Ctrl-C tears everything down.
 func Run(ctx context.Context, opt RunOptions) error {
+	if opt.RestoreMode == types.UffdRestore {
+		return errors.New("run: uffd pager runs in-process and is only supported in `branchvm bench` (VMs outlive `branchvm run`); use --pager mmap or --pager fadvise")
+	}
 	if opt.Branches < 1 || opt.Branches > maxBranches || len(opt.Cmd) == 0 || opt.TimeoutSec < 1 {
 		return fmt.Errorf("run: need 1 <= --branches <= %d, --timeout >= 1, and a command after --", maxBranches)
 	}
@@ -583,13 +628,16 @@ func Run(ctx context.Context, opt RunOptions) error {
 	if err := requireGolden(); err != nil {
 		return err
 	}
-	meta, hasMeta, err := loadGoldenMeta()
+	meta, hasMeta, err := LoadGoldenMeta()
 	if err != nil {
 		return err
 	}
 	if hasMeta && meta.RepoPath != "" && filepath.Clean(meta.RepoPath) != filepath.Clean(opt.Repo) {
 		return fmt.Errorf("golden snapshot belongs to %s, not %s: run `branchvm init` in %s first",
 			meta.RepoPath, opt.Repo, opt.Repo)
+	}
+	if opt.MemExplicit && hasMeta && meta.MemMB > 0 && opt.MemMB < meta.MemMB {
+		return fmt.Errorf("run: --mem %d MiB cannot be smaller than golden snapshot memory %d MiB", opt.MemMB, meta.MemMB)
 	}
 	if !opt.MemExplicit && meta.MemMB >= 128 {
 		opt.MemMB = meta.MemMB
@@ -602,7 +650,7 @@ func Run(ctx context.Context, opt RunOptions) error {
 	if err != nil {
 		return err
 	}
-	bcfg := branchConfigFromMeta(meta)
+	bcfg := BranchConfigFromMeta(meta)
 	portLabel := "-"
 	if hasPostgres(bcfg.Services) {
 		portLabel = "5432"
@@ -843,6 +891,13 @@ type ApplyOptions struct {
 // Apply applies one branch's diff to the host repo, then tears down the
 // whole run and scans for leaks.
 func Apply(ctx context.Context, opt ApplyOptions) error {
+	meta, hasMeta, err := LoadGoldenMeta()
+	if err != nil {
+		return err
+	}
+	if hasMeta && meta.RepoPath != "" && filepath.Clean(meta.RepoPath) != filepath.Clean(opt.Repo) {
+		return fmt.Errorf("apply: golden snapshot belongs to %s, refusing to apply patch to %s", meta.RepoPath, opt.Repo)
+	}
 	st, bs, err := resolveBranch(opt.RunID, opt.Index)
 	if err != nil {
 		return err
@@ -1081,13 +1136,21 @@ func loadPatch(ctx context.Context, runID string, bs types.BranchState) ([]byte,
 }
 
 func teardownRun(st types.RunState, live []*Branch) error {
+	var errs []error
 	for _, b := range live {
 		if b != nil {
 			b.stopGateway()
-			b.VM.kill()
+			if b.VM != nil {
+				b.VM.kill()
+			}
+			if b.pager != nil {
+				if err := b.pager.Close(); err != nil {
+					errs = append(errs, err)
+				}
+				b.pager = nil
+			}
 		}
 	}
-	var errs []error
 	for _, bs := range st.Branches {
 		errs = append(errs, teardownState(bs))
 	}
@@ -1117,6 +1180,59 @@ func removeRunFiles(runID string) error {
 	return nil
 }
 
+// cleanOrphanRunFiles removes <runID>-branch-*.patch and <runID>-branch-*.out
+// files in runsDir whose <runID>.json state file no longer exists, while
+// preserving *.patch.applied records.
+func cleanOrphanRunFiles(runsDir string) error {
+	entries, err := os.ReadDir(runsDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", runsDir, err)
+	}
+	liveRuns := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		liveRuns[strings.TrimSuffix(name, ".json")] = true
+	}
+	var errs []error
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		var suffix string
+		switch {
+		case strings.HasSuffix(name, ".patch"):
+			suffix = ".patch"
+		case strings.HasSuffix(name, ".out"):
+			suffix = ".out"
+		default:
+			continue
+		}
+		runID, rest, ok := strings.Cut(name, "-branch-")
+		if !ok || runID == "" {
+			continue
+		}
+		idxStr := strings.TrimSuffix(rest, suffix)
+		idx, err := strconv.Atoi(idxStr)
+		if err != nil || idx < 1 {
+			continue
+		}
+		if liveRuns[runID] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(runsDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove orphan run file %s: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // GC reaps crashed runs. With runID set it discards that run, live VMs included.
 func GC(out io.Writer, runID string) error {
 	if runID != "" {
@@ -1138,6 +1254,9 @@ func GC(out io.Writer, runID string) error {
 		return fmt.Errorf("gc: %w", err)
 	}
 	printGCReport(out, rep)
+	if err := cleanOrphanRunFiles(RunsDir); err != nil {
+		return err
+	}
 	if len(rep.Errors) > 0 {
 		return fmt.Errorf("gc: %d errors", len(rep.Errors))
 	}
@@ -1154,9 +1273,6 @@ func GCAll(out io.Writer) error {
 		return fmt.Errorf("list runs: %w", err)
 	}
 	for _, r := range runs {
-		if r.RunID == goldenRun {
-			continue
-		}
 		if err := GC(out, r.RunID); err != nil {
 			return err
 		}

@@ -118,14 +118,14 @@ type parser struct {
 	pos  int
 	line int
 
-	cfg      Config
-	sec      sectionKind
-	secIdx   int
-	topSeen  map[string]bool
-	secSeen  map[string]bool
-	presets  []types.ServiceSpec
-	customs  []types.ServiceSpec
-	provIdx  map[string]int
+	cfg     Config
+	sec     sectionKind
+	secIdx  int
+	topSeen map[string]bool
+	secSeen map[string]bool
+	presets []types.ServiceSpec
+	customs []types.ServiceSpec
+	provIdx map[string]int
 }
 
 func (p *parser) parseDoc() error {

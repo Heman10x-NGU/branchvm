@@ -131,3 +131,84 @@ func TestClearGoldenSnapshotFiles(t *testing.T) {
 		t.Fatalf("unrelated file removed: %v", err)
 	}
 }
+
+func TestCleanOrphanRunFiles(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]bool{
+		"r111111.json":                   true,  // live run state
+		"r111111-branch-1.patch":         true,  // belongs to live run
+		"r111111-branch-1.out":           true,  // belongs to live run
+		"r222222-branch-1.patch":         false, // orphan
+		"r222222-branch-2.out":           false, // orphan
+		"r222222-branch-1.patch.applied": true,  // applied patch must stay
+		"notes.txt":                      true,  // unrelated file must stay
+	}
+	for name := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cleanOrphanRunFiles(dir); err != nil {
+		t.Fatalf("cleanOrphanRunFiles() error: %v", err)
+	}
+	for name, wantExist := range files {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if wantExist && err != nil {
+			t.Fatalf("%s unexpectedly removed: %v", name, err)
+		}
+		if !wantExist && !os.IsNotExist(err) {
+			t.Fatalf("%s still exists, expected removal (err=%v)", name, err)
+		}
+	}
+}
+
+func TestBranchConfigFromMeta(t *testing.T) {
+	t.Run("explicit_vcpus", func(t *testing.T) {
+		cfg := BranchConfigFromMeta(types.GoldenMeta{
+			VCPUs: 4,
+			Services: []types.ServiceSpec{
+				{Name: "redis", Preset: "redis"},
+			},
+			Env: []string{"FOO=bar"},
+		})
+		if cfg.VCPUs != 4 {
+			t.Fatalf("VCPUs = %d, want 4", cfg.VCPUs)
+		}
+		if len(cfg.Services) != 1 || cfg.Services[0].Name != "redis" {
+			t.Fatalf("Services = %+v, want redis", cfg.Services)
+		}
+		if len(cfg.Env) != 1 || cfg.Env[0] != "FOO=bar" {
+			t.Fatalf("Env = %+v, want [FOO=bar]", cfg.Env)
+		}
+	})
+
+	t.Run("defaults_vcpus_when_non_positive", func(t *testing.T) {
+		cfg := BranchConfigFromMeta(types.GoldenMeta{VCPUs: 0})
+		if cfg.VCPUs != coldVCPUs {
+			t.Fatalf("VCPUs = %d, want %d", cfg.VCPUs, coldVCPUs)
+		}
+		if cfg.Services == nil || len(cfg.Services) != 0 {
+			t.Fatalf("Services = %#v, want empty non-nil slice", cfg.Services)
+		}
+	})
+}
+
+func TestHasCustomServices(t *testing.T) {
+	tests := []struct {
+		name     string
+		services []types.ServiceSpec
+		want     bool
+	}{
+		{name: "stateless", services: nil, want: false},
+		{name: "preset_only", services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}, {Name: "redis", Preset: "redis"}}, want: false},
+		{name: "custom_only", services: []types.ServiceSpec{{Name: "api", Cmd: []string{"node", "server.js"}}}, want: true},
+		{name: "mixed", services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}, {Name: "worker", Cmd: []string{"./worker"}}}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasCustomServices(tc.services); got != tc.want {
+				t.Fatalf("hasCustomServices(%+v) = %t, want %t", tc.services, got, tc.want)
+			}
+		})
+	}
+}

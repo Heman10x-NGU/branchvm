@@ -27,8 +27,9 @@ done
 
 if [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
-  TAG="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  [ -n "$TAG" ] || die "could not resolve latest release tag for ${REPO}"
+  RESOLVED="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
+  TAG="${RESOLVED##*/}"
+  [ -n "$TAG" ] && [ "$TAG" != "latest" ] || die "could not resolve latest release tag for ${REPO}"
 else
   TAG="$VERSION"
   BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
@@ -59,3 +60,4 @@ echo "  ${SHARE_DIR}/fetch-assets.sh"
 echo
 echo "next step (if Firecracker >= 1.17.0 and Linux >= 6.10 kernel are not yet installed):"
 echo "  sudo bash ${SHARE_DIR}/fetch-assets.sh"
+echo "  then use image/dockerfile in branchvm.toml (no base rootfs needed), or optionally run scripts/build-rootfs.sh for base-rootfs mode"

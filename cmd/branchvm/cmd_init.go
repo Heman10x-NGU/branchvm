@@ -23,8 +23,12 @@ func cmdInit(ctx context.Context, args []string) error {
 	mem := fs.Int64("mem", 1024, "guest memory in MiB")
 	cpus := fs.Int("cpus", 2, "guest vCPUs")
 	warm := fs.String("warm", "", "command to run in the golden /workspace before the checkpoint")
+	warmTimeout := fs.Int("warm-timeout", 1800, "warm command timeout in seconds")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *warmTimeout < 0 {
+		return fmt.Errorf("--warm-timeout must be >= 0, got %d", *warmTimeout)
 	}
 	if err := requireRoot(); err != nil {
 		return err
@@ -63,20 +67,24 @@ func cmdInit(ctx context.Context, args []string) error {
 	if !explicit["warm"] {
 		*warm = cfg.Warm
 	}
+	if !explicit["warm-timeout"] {
+		*warmTimeout = cfg.WarmTimeoutSec
+	}
 
 	return pool.Init(ctx, pool.InitOptions{
-		Repo:         dir,
-		Image:        *image,
-		Dockerfile:   dockerfile,
-		ExecdPath:    *execd,
-		RootfsSizeMB: *rootfsSize,
-		MemMB:        *mem,
-		VCPUs:        *cpus,
-		WarmCmd:      *warm,
-		Database:     cfg.Database,
-		Services:     cfg.Services,
-		Env:          cfg.Env,
-		Providers:    cfg.Providers,
-		Out:          os.Stdout,
+		Repo:           dir,
+		Image:          *image,
+		Dockerfile:     dockerfile,
+		ExecdPath:      *execd,
+		RootfsSizeMB:   *rootfsSize,
+		MemMB:          *mem,
+		VCPUs:          *cpus,
+		WarmCmd:        *warm,
+		WarmTimeoutSec: *warmTimeout,
+		Database:       cfg.Database,
+		Services:       cfg.Services,
+		Env:            cfg.Env,
+		Providers:      cfg.Providers,
+		Out:            os.Stdout,
 	})
 }

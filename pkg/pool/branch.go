@@ -46,6 +46,7 @@ var RestoreTimeout = 30 * time.Second
 // BranchConfig holds per-snapshot runtime environment, service, and gateway
 // provider settings passed to restored branch VMs.
 type BranchConfig struct {
+	VCPUs     int
 	Services  []types.ServiceSpec
 	Env       []string
 	Providers []types.ProviderSpec
@@ -53,20 +54,31 @@ type BranchConfig struct {
 
 func defaultBranchConfig() BranchConfig {
 	return BranchConfig{
+		VCPUs:    coldVCPUs,
 		Services: []types.ServiceSpec{{Name: "postgres", Preset: "postgres"}},
 	}
 }
 
-func branchConfigFromMeta(meta types.GoldenMeta) BranchConfig {
+// BranchConfigFromMeta extracts runtime branch settings from golden metadata.
+func BranchConfigFromMeta(meta types.GoldenMeta) BranchConfig {
 	svcs := meta.Services
 	if svcs == nil {
 		svcs = []types.ServiceSpec{}
 	}
+	cpus := meta.VCPUs
+	if cpus <= 0 {
+		cpus = coldVCPUs
+	}
 	return BranchConfig{
+		VCPUs:     cpus,
 		Services:  svcs,
 		Env:       meta.Env,
 		Providers: meta.Providers,
 	}
+}
+
+func branchConfigFromMeta(meta types.GoldenMeta) BranchConfig {
+	return BranchConfigFromMeta(meta)
 }
 
 func hasPostgres(services []types.ServiceSpec) bool {
@@ -236,16 +248,15 @@ func (g *guest) health(ctx context.Context) (types.HealthResponse, error) {
 	return h, err
 }
 
-// waitReady polls /health until execd and all configured services report ready.
-func (g *guest) waitReady(ctx context.Context, timeout, interval time.Duration, progress func(time.Duration, error)) error {
+func (g *guest) waitHealth(ctx context.Context, timeout, interval time.Duration, progress func(time.Duration, error), ready func(types.HealthResponse) (bool, error)) error {
 	start := time.Now()
 	for {
 		h, err := g.health(ctx)
-		if err == nil && h.OK && (h.ServicesReady || (h.PgReady && len(h.Services) == 0)) {
-			return nil
-		}
 		if err == nil {
-			err = fmt.Errorf("ok=%t services_ready=%t pg_ready=%t", h.OK, h.ServicesReady, h.PgReady)
+			var ok bool
+			if ok, err = ready(h); ok {
+				return nil
+			}
 		}
 		if progress != nil {
 			progress(time.Since(start), err)
@@ -259,6 +270,54 @@ func (g *guest) waitReady(ctx context.Context, timeout, interval time.Duration, 
 		case <-time.After(interval):
 		}
 	}
+}
+
+// waitPresetsReady polls /health until execd and preset services report ready.
+func (g *guest) waitPresetsReady(ctx context.Context, timeout, interval time.Duration, progress func(time.Duration, error)) error {
+	return g.waitHealth(ctx, timeout, interval, progress, func(h types.HealthResponse) (bool, error) {
+		if h.OK && (h.PresetsReady || h.ServicesReady || (h.PgReady && len(h.Services) == 0)) {
+			return true, nil
+		}
+		return false, fmt.Errorf("ok=%t presets_ready=%t services_ready=%t pg_ready=%t", h.OK, h.PresetsReady, h.ServicesReady, h.PgReady)
+	})
+}
+
+// waitReady polls /health until execd and all configured services report ready.
+func (g *guest) waitReady(ctx context.Context, timeout, interval time.Duration, progress func(time.Duration, error)) error {
+	return g.waitHealth(ctx, timeout, interval, progress, func(h types.HealthResponse) (bool, error) {
+		if h.OK && (h.ServicesReady || (h.PgReady && len(h.Services) == 0)) {
+			return true, nil
+		}
+		return false, fmt.Errorf("ok=%t services_ready=%t pg_ready=%t", h.OK, h.ServicesReady, h.PgReady)
+	})
+}
+
+func (g *guest) startServices(ctx context.Context) error {
+	return withTimeout(ctx, 30*time.Second, func(ctx context.Context) error {
+		_, err := g.do(ctx, http.MethodPost, "/services/start", "application/json", nil, nil)
+		return err
+	})
+}
+
+func (g *guest) rebase(ctx context.Context) error {
+	return withTimeout(ctx, 2*time.Minute, func(ctx context.Context) error {
+		_, err := g.do(ctx, http.MethodPost, "/rebase", "application/json", nil, nil)
+		return err
+	})
+}
+
+func (g *guest) probe(ctx context.Context, req types.ProbeRequest) (types.ProbeResponse, error) {
+	var res types.ProbeResponse
+	body, err := json.Marshal(req)
+	if err != nil {
+		return res, fmt.Errorf("encode probe request: %w", err)
+	}
+	limit := time.Duration(max(req.TimeoutMs, 5000)+5000) * time.Millisecond
+	err = withTimeout(ctx, limit, func(ctx context.Context) error {
+		_, err := g.do(ctx, http.MethodPost, "/probe", "application/json", bytes.NewReader(body), &res)
+		return err
+	})
+	return res, err
 }
 
 func (g *guest) entropy(ctx context.Context) (types.EntropyResponse, error) {
@@ -513,7 +572,11 @@ func (b *Branch) restore(ctx context.Context) error {
 
 // bootColdReady boots the clone's kernel from scratch and waits for ready.
 func (b *Branch) bootColdReady(ctx context.Context, start time.Time) error {
-	if err := b.VM.bootCold(b.memMB, coldVCPUs, b.Net.TapName); err != nil {
+	cpus := b.cfg.VCPUs
+	if cpus <= 0 {
+		cpus = coldVCPUs
+	}
+	if err := b.VM.bootCold(b.memMB, cpus, b.Net.TapName); err != nil {
 		return err
 	}
 	b.Guest = newGuest(b.Net.GuestAPIAddr)
@@ -558,6 +621,8 @@ func (b *Branch) memBackend(ctx context.Context) (fcclient.MemBackend, error) {
 	return file, fmt.Errorf("unknown restore mode %q", b.Mode)
 }
 
+// awaitPager surfaces a failed uffd handshake instead of a guest that
+// hangs on its first page fault until restoreTimeout.
 func (b *Branch) awaitPager() error {
 	if b.pager == nil {
 		return nil
@@ -626,17 +691,14 @@ func (b *Branch) startGateway() error {
 		return fmt.Errorf("gateway: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	b.gwCancel, b.gwDone = cancel, make(chan error, 1)
-	go func() { b.gwDone <- gw.Serve(ctx) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if c, err := net.DialTimeout("tcp", b.Net.GatewayAddr, 200*time.Millisecond); err == nil {
-			c.Close()
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
+	ln, err := gw.Listen()
+	if err != nil {
+		cancel()
+		return fmt.Errorf("gateway: %w", err)
 	}
-	return fmt.Errorf("gateway %s not listening", b.Net.GatewayAddr)
+	b.gwCancel, b.gwDone = cancel, make(chan error, 1)
+	go func() { b.gwDone <- gw.ServeListener(ctx, ln) }()
+	return nil
 }
 
 func (b *Branch) stopGateway() {
@@ -665,6 +727,8 @@ func (b *Branch) Teardown() error {
 	return errors.Join(perr, teardownState(b.State("")))
 }
 
+// teardownState removes one branch's resources from its saved state. It is
+// idempotent and safe to call from a process that did not launch the branch.
 func teardownState(b types.BranchState) error {
 	ops := cgroup.HostOps{}
 	if isFirecracker(b.FirecrackerPID) {
@@ -687,6 +751,7 @@ func teardownState(b types.BranchState) error {
 	return nil
 }
 
+// procInfo parses /proc/<pid>/stat: "pid (comm) state ...".
 func procInfo(pid int) (comm string, state byte, ok bool) {
 	if pid <= 0 {
 		return "", 0, false
@@ -702,6 +767,7 @@ func procInfo(pid int) (comm string, state byte, ok bool) {
 	return string(raw[open+1 : end]), raw[end+2], true
 }
 
+// isFirecracker guards every kill against PID reuse and ignores zombies.
 func isFirecracker(pid int) bool {
 	comm, state, ok := procInfo(pid)
 	return ok && comm == "firecracker" && state != 'Z'

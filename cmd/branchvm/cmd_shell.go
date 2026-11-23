@@ -7,6 +7,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/Heman10x-NGU/branchvm/pkg/pool"
 )
@@ -46,7 +48,14 @@ func cmdShell(ctx context.Context, args []string) error {
 	if err := requireRoot(); err != nil {
 		return err
 	}
-	code, err := pool.Shell(ctx, pool.ShellOptions{
+	sigs := []os.Signal{syscall.SIGTERM, syscall.SIGHUP}
+	if len(cmd) > 0 {
+		sigs = append(sigs, os.Interrupt)
+	}
+	sigCtx, stop := signal.NotifyContext(ctx, sigs...)
+	defer stop()
+
+	code, err := pool.Shell(sigCtx, pool.ShellOptions{
 		Index:      idx,
 		RunID:      runID,
 		Cmd:        cmd,
@@ -55,6 +64,10 @@ func cmdShell(ctx context.Context, args []string) error {
 		Stdout:     os.Stdout,
 	})
 	if err != nil {
+		if code == 124 {
+			fmt.Fprintf(os.Stderr, "branchvm shell: %v\n", err)
+			return exitCodeError(124)
+		}
 		return err
 	}
 	if code != 0 {

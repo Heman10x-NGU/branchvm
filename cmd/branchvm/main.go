@@ -16,9 +16,9 @@ import (
 const usage = `usage: branchvm <command> [flags]
 
 commands:
-  init     [--repo DIR] [--image IMG] [--mem 1024] [--cpus 2] [--warm CMD] [--rootfs-size MB] [--execd PATH]
+  init     [--repo DIR] [--image IMG] [--mem 1024] [--cpus 2] [--warm CMD] [--warm-timeout 1800] [--rootfs-size MB] [--execd PATH]
            boot the golden VM (from base rootfs, Docker image, or branchvm.toml), sync repo, snapshot
-  run      --branches N [--repo DIR] [--mem MB] [--timeout 600] [--pager mmap|fadvise|uffd] -- CMD ARGS...
+  run      --branches N [--repo DIR] [--mem MB] [--timeout 600] [--pager mmap|fadvise] -- CMD ARGS...
            restore N branches, sync deltas, run CMD in each; VMs stay up for inspection and apply
   logs     <i> [--run RUNID]
            print saved stdout and stderr for branch i
@@ -38,6 +38,8 @@ commands:
            measure boot, pager, and RAM density; writes raw.jsonl and BENCHMARKS.md
 `
 
+// command is registered by the Linux-only cmd_*.go files. On other systems
+// the table stays empty and main explains that branchvm needs Linux.
 type command func(ctx context.Context, args []string) error
 
 var commands = map[string]command{}
