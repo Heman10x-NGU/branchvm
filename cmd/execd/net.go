@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	ifaAddress = 1
-	ifaLocal   = 2
-	rtaOIF     = 4
-	rtaGateway = 5
+	ifaAddress  = 1
+	ifaLocal    = 2
+	rtaOIF      = 4
+	rtaGateway  = 5
 	rtTableMain = 254
 	rtProtBoot  = 3
 	rtNUnicast  = 1

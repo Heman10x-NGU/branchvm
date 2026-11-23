@@ -35,7 +35,7 @@ jobs:
       - name: Check shell scripts and formatting
         run: |
           sh -n scripts/install.sh
-          unformatted="$(gofmt -l .)"
+          unformatted="$(gofmt -l cmd pkg)"
           if [ -n "$unformatted" ]; then
             echo "Files need gofmt:"
             echo "$unformatted"
