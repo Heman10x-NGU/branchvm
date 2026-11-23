@@ -24,9 +24,24 @@ import (
 
 // gitOutput runs git in repoDir and returns stdout, wrapping stderr on error.
 func gitOutput(repoDir string, args ...string) ([]byte, error) {
+	return gitRunWithStdin(repoDir, nil, false, args...)
+}
+
+// gitRunWithStdin runs git with safe.directory=*, optional stdin bytes, and
+// optional credential dropping to the repo owner when running as root.
+func gitRunWithStdin(repoDir string, stdin []byte, dropToOwner bool, args ...string) ([]byte, error) {
+	fullArgs := make([]string, 0, len(args)+2)
+	fullArgs = append(fullArgs, "-c", "safe.directory=*")
+	fullArgs = append(fullArgs, args...)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", fullArgs...)
 	cmd.Dir = repoDir
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	if dropToOwner {
+		applyRepoOwnerCred(cmd, repoDir)
+	}
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -356,29 +371,18 @@ func ApplyPatch(repoDir string, patch []byte) error {
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil
 	}
-	tmp, err := os.CreateTemp("", "branchvm-patch-*.diff")
-	if err != nil {
-		return fmt.Errorf("create patch temp file: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-	_, werr := tmp.Write(patch)
-	cerr := tmp.Close()
-	if werr != nil {
-		return fmt.Errorf("write patch: %w", werr)
-	}
-	if cerr != nil {
-		return fmt.Errorf("close patch: %w", cerr)
-	}
 	applyDir := repoDir
 	var dirArgs []string
 	if top, prefix, err := repoLocation(repoDir); err == nil && prefix != "" {
 		applyDir = top
 		dirArgs = []string{"--directory=" + strings.TrimSuffix(prefix, "/")}
 	}
-	if _, err := gitOutput(applyDir, append(append([]string{"apply", "--check", "--binary"}, dirArgs...), tmp.Name())...); err != nil {
+	checkArgs := append(append([]string{"apply", "--check", "--binary"}, dirArgs...), "-")
+	if _, err := gitRunWithStdin(applyDir, patch, true, checkArgs...); err != nil {
 		return fmt.Errorf("patch check failed: %w", err)
 	}
-	if _, err := gitOutput(applyDir, append(append([]string{"apply", "--binary", "--whitespace=nowarn"}, dirArgs...), tmp.Name())...); err != nil {
+	applyArgs := append(append([]string{"apply", "--binary", "--whitespace=nowarn"}, dirArgs...), "-")
+	if _, err := gitRunWithStdin(applyDir, patch, true, applyArgs...); err != nil {
 		return fmt.Errorf("patch apply failed: %w", err)
 	}
 	return nil

@@ -2,6 +2,7 @@ package rootfs
 
 import (
 	"bytes"
+	"context"
 	"debug/elf"
 	"encoding/binary"
 	"os"
@@ -223,5 +224,80 @@ func TestResolveDockerfileContainment(t *testing.T) {
 	}
 	if _, _, err := ResolveDockerfile(repo, "EscapeDockerfile"); err == nil {
 		t.Fatal("expected containment error for symlinked EscapeDockerfile")
+	}
+}
+
+func TestComputeExt4SizingHighInodeAndBlockRounding(t *testing.T) {
+	// 500,000 small files occupying one 4 KiB block each.
+	sizeMB, inodes := ComputeExt4Sizing(500000*4096, 500000, 0)
+	if sizeMB < 2300 || sizeMB%roundStepMB != 0 {
+		t.Fatalf("500k small files sizeMB = %d, want >= 2300 aligned to %d", sizeMB, roundStepMB)
+	}
+	wantInodes := int64(500000*2 + inodeMargin)
+	if inodes != wantInodes {
+		t.Fatalf("500k small files inodes = %d, want %d", inodes, wantInodes)
+	}
+
+	// Increasing entry count with fixed byte total must grow image size for inode table overhead.
+	lowEntriesMB, _ := ComputeExt4Sizing(1000<<20, 1000, 0)
+	highEntriesMB, _ := ComputeExt4Sizing(1000<<20, 2000000, 0)
+	if highEntriesMB <= lowEntriesMB {
+		t.Fatalf("expected high entry count size (%d MiB) > low entry count size (%d MiB)", highEntriesMB, lowEntriesMB)
+	}
+}
+
+func TestMeasureDirExt4BlocksAndHardlinks(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tiny := filepath.Join(sub, "tiny.txt")
+	if err := os.WriteFile(tiny, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	medium := filepath.Join(sub, "medium.bin")
+	if err := os.WriteFile(medium, bytes.Repeat([]byte("a"), 5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(tiny, filepath.Join(sub, "tiny-hardlink.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	gotBytes, gotEntries, err := measureDir(root)
+	if err != nil {
+		t.Fatalf("measureDir: %v", err)
+	}
+	// Entries: root dir, sub dir, tiny.txt, medium.bin, tiny-hardlink.txt = 5.
+	if gotEntries != 5 {
+		t.Fatalf("measureDir entries = %d, want 5", gotEntries)
+	}
+	// Allocated ext4 4 KiB blocks: 2 dirs (8192) + 1-byte file (4096) + 5000-byte file (8192) = 20480.
+	// Hardlink shares tiny.txt's inode and adds 0 bytes.
+	const wantBytes = int64(4096 + 4096 + 4096 + 8192)
+	if gotBytes != wantBytes {
+		t.Fatalf("measureDir bytesTotal = %d, want %d", gotBytes, wantBytes)
+	}
+}
+
+func TestUntarPreservingRootRequiresTarBinary(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	err := untarPreservingRoot(context.Background(), strings.NewReader(""), t.TempDir())
+	if err == nil {
+		t.Fatal("expected error when tar binary is missing from PATH")
+	}
+	if !strings.Contains(err.Error(), "tar") {
+		t.Fatalf("expected clear tar missing error, got %v", err)
+	}
+}
+
+func TestInjectBaseOverlayValidatesExecd(t *testing.T) {
+	badExecd := filepath.Join(t.TempDir(), "execd-bad")
+	if err := os.WriteFile(badExecd, []byte("not-an-elf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err := InjectBaseOverlay(context.Background(), filepath.Join(t.TempDir(), "rootfs.ext4"), badExecd, nil)
+	if err == nil {
+		t.Fatal("expected error for non-ELF execd")
 	}
 }
