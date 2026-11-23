@@ -4,7 +4,11 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/Heman10x-NGU/branchvm/pkg/pool"
+	"github.com/Heman10x-NGU/branchvm/pkg/types"
 )
 
 func TestParseShellArgs(t *testing.T) {
@@ -44,4 +48,16 @@ func TestParseShellArgs(t *testing.T) {
 			t.Fatal("expected error for negative --timeout")
 		}
 	})
+}
+
+func TestParsePager(t *testing.T) {
+	if got, err := parsePager("mmap"); err != nil || got != types.FileRestore {
+		t.Fatalf("parsePager(mmap) = (%q, %v), want (%q, nil)", got, err, types.FileRestore)
+	}
+	if got, err := parsePager("fadvise"); err != nil || got != pool.PrefaultRestore {
+		t.Fatalf("parsePager(fadvise) = (%q, %v), want (%q, nil)", got, err, pool.PrefaultRestore)
+	}
+	if _, err := parsePager("uffd"); err == nil || !strings.Contains(err.Error(), "bench") {
+		t.Fatalf("parsePager(uffd) err = %v, want error mentioning bench", err)
+	}
 }

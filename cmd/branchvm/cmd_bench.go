@@ -65,6 +65,7 @@ type benchConfig struct {
 
 type bench struct {
 	cfg          benchConfig
+	bcfg         pool.BranchConfig
 	out          io.Writer
 	raw          *os.File
 	enc          *json.Encoder
@@ -97,8 +98,21 @@ func cmdBench(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
 	if err := pool.BenchPreflight(os.Stdout); err != nil {
 		return err
+	}
+	meta, hasMeta, err := pool.LoadGoldenMeta()
+	if err != nil {
+		return err
+	}
+	if !explicit["mem"] && hasMeta && meta.MemMB >= 128 {
+		*mem = meta.MemMB
+	}
+	if explicit["mem"] && hasMeta && meta.MemMB > 0 && *mem < meta.MemMB {
+		return fmt.Errorf("bench: --mem %d MiB cannot be smaller than golden snapshot memory %d MiB", *mem, meta.MemMB)
 	}
 	if err := os.MkdirAll(*outDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", *outDir, err)
@@ -112,8 +126,9 @@ func cmdBench(ctx context.Context, args []string) error {
 	defer cancel()
 	cgroup.InstallCleanupTrap(cancel)
 	b := &bench{
-		cfg: benchConfig{repo: dir, iters: *iters, outDir: *outDir, memMB: *mem, fast: *fast, maxClones: *maxClones},
-		out: os.Stdout, raw: raw, enc: json.NewEncoder(raw), runBase: time.Now().Unix(),
+		cfg:  benchConfig{repo: dir, iters: *iters, outDir: *outDir, memMB: *mem, fast: *fast, maxClones: *maxClones},
+		bcfg: pool.BranchConfigFromMeta(meta),
+		out:  os.Stdout, raw: raw, enc: json.NewEncoder(raw), runBase: time.Now().Unix(),
 	}
 	return b.run(ctx)
 }
@@ -246,7 +261,7 @@ func (b *bench) launchN(ctx context.Context, run *benchRun, n int, mode types.Re
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			br, err := pool.LaunchBranch(ctx, run.id, i, b.cfg.memMB, mode, run.record)
+			br, err := pool.LaunchBranchConfigured(ctx, run.id, i, b.cfg.memMB, mode, b.bcfg, run.record)
 			brs[i-1] = br
 			if err == nil && after != nil {
 				err = after(ctx, br)
@@ -313,14 +328,20 @@ func (b *bench) bootTable(ctx context.Context) error {
 					mode: m.mode,
 				}
 				if m.name == modeRun3 {
-					var tgz []byte
-					s.pre = func() (err error) {
-						if tgz, err = storage.PackWorkspace(b.cfg.repo); err != nil {
+					var body []byte
+					var ctype string
+					s.pre = func() error {
+						tgz, err := storage.PackWorkspace(b.cfg.repo)
+						if err != nil {
 							return fmt.Errorf("pack workspace %s: %w", b.cfg.repo, err)
+						}
+						body, ctype, err = storage.EncodeSyncMultipart(types.SyncMeta{Mode: "full"}, tgz)
+						if err != nil {
+							return fmt.Errorf("encode workspace sync: %w", err)
 						}
 						return nil
 					}
-					s.after = func(ctx context.Context, br *pool.Branch) error { return br.Sync(ctx, tgz) }
+					s.after = func(ctx context.Context, br *pool.Branch) error { return br.SyncMultipart(ctx, ctype, body) }
 				}
 				if err := b.sampleEmit(ctx, s); err != nil {
 					return err

@@ -59,7 +59,7 @@ func TestAuthDemoConfigLoads(t *testing.T) {
 	if !found {
 		t.Fatal("examples/auth-demo/branchvm.toml not found")
 	}
-	if cfg.Database != "authdemo" || cfg.Warm != "go test -run ^$ ./..." {
+	if cfg.Database != "authdemo" || cfg.Warm != "go test -mod=vendor -run ^$ ./..." {
 		t.Fatalf("unexpected auth-demo config: %+v", cfg)
 	}
 	if len(cfg.Services) != 1 || cfg.Services[0].Preset != "postgres" {
