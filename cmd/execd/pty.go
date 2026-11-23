@@ -23,11 +23,11 @@ import (
 )
 
 const (
-	ioctlTIOCSCTTY = 0x540E
+	ioctlTIOCSCTTY  = 0x540E
 	ioctlTIOCSWINSZ = 0x5414
-	ioctlTIOCGPTN  = 0x80045430
+	ioctlTIOCGPTN   = 0x80045430
 	ioctlTIOCSPTLCK = 0x40045431
-	maxPTYReqBytes = 64 << 10
+	maxPTYReqBytes  = 64 << 10
 )
 
 type ptyWinsize struct {
@@ -51,7 +51,7 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.Dir == "" {
-		req.Dir = workspaceDir
+		req.Dir = a.workspace()
 	}
 	if req.Rows == 0 {
 		req.Rows = 24
@@ -66,7 +66,7 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer master.Close()
-	_ = setWinsize(master.Fd(), req.Rows, req.Cols)
+	_ = setWinsize(master, req.Rows, req.Cols)
 
 	cmd := exec.Command(req.Cmd[0], req.Cmd[1:]...)
 	cmd.Dir = req.Dir
@@ -151,6 +151,7 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 	clientDone := make(chan struct{})
 	go func() {
 		defer close(clientDone)
+		lastByte := byte('\n')
 		for {
 			kind, payload, err := types.ReadPTYFrame(rw.Reader)
 			if err != nil {
@@ -174,12 +175,27 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 					if _, err := master.Write(payload); err != nil {
 						return
 					}
+					lastByte = payload[len(payload)-1]
 				}
+			case types.PTYFrameEOF:
+				if lastByte == '\n' || lastByte == '\r' {
+					if _, err := master.Write([]byte{4}); err != nil {
+						return
+					}
+				} else {
+					if _, err := master.Write([]byte{4}); err != nil {
+						return
+					}
+					if _, err := master.Write([]byte{4}); err != nil {
+						return
+					}
+				}
+				lastByte = '\n'
 			case types.PTYFrameResize:
 				if len(payload) == 4 {
 					rows := binary.BigEndian.Uint16(payload[0:2])
 					cols := binary.BigEndian.Uint16(payload[2:4])
-					_ = setWinsize(master.Fd(), rows, cols)
+					_ = setWinsize(master, rows, cols)
 				}
 			}
 		}
@@ -220,6 +236,23 @@ func (a *agent) handlePTY(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func ptyIoctl(f *os.File, req uintptr, arg unsafe.Pointer) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var errno syscall.Errno
+	if err := rc.Control(func(fd uintptr) {
+		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(arg))
+	}); err != nil {
+		return err
+	}
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func openPTY() (master, slave *os.File, err error) {
 	master, err = os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_CLOEXEC|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -231,12 +264,12 @@ func openPTY() (master, slave *os.File, err error) {
 	}
 
 	var unlock int32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), ioctlTIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
-		return cleanup(fmt.Errorf("TIOCSPTLCK: %w", errno))
+	if err := ptyIoctl(master, ioctlTIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
+		return cleanup(fmt.Errorf("TIOCSPTLCK: %w", err))
 	}
 	var ptn uint32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, master.Fd(), ioctlTIOCGPTN, uintptr(unsafe.Pointer(&ptn))); errno != 0 {
-		return cleanup(fmt.Errorf("TIOCGPTN: %w", errno))
+	if err := ptyIoctl(master, ioctlTIOCGPTN, unsafe.Pointer(&ptn)); err != nil {
+		return cleanup(fmt.Errorf("TIOCGPTN: %w", err))
 	}
 	slavePath := fmt.Sprintf("/dev/pts/%d", ptn)
 	slave, err = os.OpenFile(slavePath, os.O_RDWR|syscall.O_NOCTTY, 0)
@@ -246,13 +279,9 @@ func openPTY() (master, slave *os.File, err error) {
 	return master, slave, nil
 }
 
-func setWinsize(fd uintptr, rows, cols uint16) error {
+func setWinsize(master *os.File, rows, cols uint16) error {
 	ws := ptyWinsize{Rows: rows, Cols: cols}
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, ioctlTIOCSWINSZ, uintptr(unsafe.Pointer(&ws)))
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return ptyIoctl(master, ioctlTIOCSWINSZ, unsafe.Pointer(&ws))
 }
 
 func (a *agent) handleTCP(w http.ResponseWriter, r *http.Request) {

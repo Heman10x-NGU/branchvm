@@ -28,6 +28,7 @@ import (
 )
 
 const (
+	execdVersion      = "0.2.1"
 	guestAddr         = "172.16.0.2"
 	guestCIDR         = guestAddr + "/30"
 	gatewayAddr       = "172.16.0.1"
@@ -67,22 +68,26 @@ type agent struct {
 	degraded      atomic.Bool
 	pgAlive       atomic.Bool
 	pgReady       atomic.Bool
+	presetsReady  atomic.Bool
 	servicesReady atomic.Bool
 
 	imageEnv []string
 	services []types.ServiceSpec
 
-	svcMu    sync.Mutex
-	svcState map[string]bool
-	svcDead  map[string]bool
+	svcMu         sync.Mutex
+	svcState      map[string]bool
+	svcDead       map[string]bool
+	customStarted bool
 
 	credMu     sync.Mutex
 	pgCred     *syscall.Credential
+	pgHome     string
 	pgBinDir   string
 	pgDataDir  string
 	pgConfFile string
 
 	wsMu    sync.Mutex
+	wsDir   string
 	baseSHA string
 }
 

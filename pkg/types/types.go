@@ -26,6 +26,7 @@ const (
 	PTYFrameData     byte = 1
 	PTYFrameResize   byte = 2
 	PTYFrameExit     byte = 3
+	PTYFrameEOF      byte = 4
 	PTYMaxFrameBytes      = 64 << 10
 )
 
@@ -109,10 +110,29 @@ type ExecResponse struct {
 type HealthResponse struct {
 	OK            bool            `json:"ok"`
 	PgReady       bool            `json:"pg_ready"`
+	PresetsReady  bool            `json:"presets_ready"`
 	ServicesReady bool            `json:"services_ready"`
 	Services      map[string]bool `json:"services,omitempty"`
+	Version       string          `json:"version,omitempty"`
 	UptimeSec     int64           `json:"uptime_sec"`
 	Hostname      string          `json:"hostname"`
+}
+
+// ProbeRequest asks execd to test guest-side network reachability.
+type ProbeRequest struct {
+	Kind      string `json:"kind"` // "tcp", "udp-dns", "http"
+	Addr      string `json:"addr,omitempty"`
+	URL       string `json:"url,omitempty"`
+	HeaderKey string `json:"header_key,omitempty"`
+	HeaderVal string `json:"header_val,omitempty"`
+	TimeoutMs int    `json:"timeout_ms,omitempty"`
+}
+
+// ProbeResponse reports the outcome of a guest-side network probe.
+type ProbeResponse struct {
+	OK         bool   `json:"ok"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // EntropyResponse exposes per-guest identity so tests can prove clones

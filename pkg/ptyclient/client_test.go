@@ -197,3 +197,85 @@ func TestAttachCancelDuringHandshake(t *testing.T) {
 		t.Fatalf("Attach took too long on canceled handshake: %s", time.Since(start))
 	}
 }
+
+func TestAttachSendsEOFForCommandAndReturnsContextCanceled(t *testing.T) {
+	eofSeen := make(chan struct{})
+	addr := startMockGuestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req types.PTYRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: bvm-pty\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+
+		for {
+			kind, payload, err := types.ReadPTYFrame(rw.Reader)
+			if err != nil {
+				return
+			}
+			if kind == types.PTYFrameData {
+				_ = types.WritePTYFrame(conn, types.PTYFrameData, payload)
+			} else if kind == types.PTYFrameEOF {
+				close(eofSeen)
+				var code [4]byte
+				_ = types.WritePTYFrame(conn, types.PTYFrameExit, code[:])
+				return
+			}
+		}
+	}))
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	go func() {
+		_, _ = pw.WriteString("payload")
+		_ = pw.Close()
+	}()
+
+	var out bytes.Buffer
+	code, err := Attach(context.Background(), addr, types.PTYRequest{Cmd: []string{"cat"}}, pr, &out)
+	if err != nil || code != 0 {
+		t.Fatalf("Attach = (%d, %v), want (0, nil)", code, err)
+	}
+	if out.String() != "payload" {
+		t.Fatalf("stdout = %q, want payload", out.String())
+	}
+	select {
+	case <-eofSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not receive PTYFrameEOF")
+	}
+
+	// Verify canceled context after handshake returns non-zero exit and context.Canceled.
+	hold := make(chan struct{})
+	defer close(hold)
+	cancelAddr := startMockGuestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: bvm-pty\r\nConnection: Upgrade\r\n\r\n")
+		_ = rw.Flush()
+		<-hold
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	code, err = Attach(ctx, cancelAddr, types.PTYRequest{Cmd: []string{"sleep", "5"}}, nil, io.Discard)
+	if code == 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Attach = (%d, %v), want (non-zero, context.Canceled)", code, err)
+	}
+}

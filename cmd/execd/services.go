@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
@@ -59,28 +60,45 @@ func parseServiceSpecs(raw []byte) ([]types.ServiceSpec, error) {
 	return specs, nil
 }
 
+func isPresetService(svc types.ServiceSpec) bool {
+	return svc.Preset == "postgres" || svc.Preset == "redis"
+}
+
 func (a *agent) runServices() {
 	if len(a.services) == 0 {
 		a.pgReady.Store(true)
+		a.presetsReady.Store(true)
 		a.servicesReady.Store(true)
 		log.Printf("execd: stateless guest (0 background services)")
 		return
 	}
 
 	hasPG := false
+	hasPreset := false
 	a.svcMu.Lock()
+	if a.svcState == nil {
+		a.svcState = map[string]bool{}
+	}
 	for _, s := range a.services {
 		a.svcState[s.Name] = false
 		if s.Preset == "postgres" {
 			hasPG = true
 		}
+		if isPresetService(s) {
+			hasPreset = true
+		}
 	}
+	a.recomputeReadyLocked()
 	a.svcMu.Unlock()
 
 	if !hasPG {
 		a.pgReady.Store(true)
 	}
+	if !hasPreset {
+		a.presetsReady.Store(true)
+	}
 
+	// Start only preset services at boot; custom services start via POST /services/start after /sync.
 	for _, svc := range a.services {
 		svc := svc
 		switch svc.Preset {
@@ -88,10 +106,28 @@ func (a *agent) runServices() {
 			go a.runPostgres(svc.Name)
 		case "redis":
 			go a.runRedis(svc)
-		default:
-			go a.runCustomService(svc)
 		}
 	}
+}
+
+func (a *agent) handleStartServices(w http.ResponseWriter, _ *http.Request) {
+	var toStart []types.ServiceSpec
+	a.svcMu.Lock()
+	if !a.customStarted {
+		a.customStarted = true
+		for _, svc := range a.services {
+			if svc.Preset == "" {
+				toStart = append(toStart, svc)
+			}
+		}
+	}
+	a.svcMu.Unlock()
+
+	for _, svc := range toStart {
+		svc := svc
+		go a.runCustomService(svc)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (a *agent) setServiceReady(name string, ready bool) {
@@ -104,7 +140,7 @@ func (a *agent) setServiceReady(name string, ready bool) {
 		return
 	}
 	a.svcState[name] = ready
-	a.recomputeServicesReadyLocked()
+	a.recomputeReadyLocked()
 }
 
 func (a *agent) markServiceDead(name string) {
@@ -118,10 +154,10 @@ func (a *agent) markServiceDead(name string) {
 	}
 	a.svcDead[name] = true
 	a.svcState[name] = false
-	a.recomputeServicesReadyLocked()
+	a.recomputeReadyLocked()
 }
 
-func (a *agent) recomputeServicesReadyLocked() {
+func (a *agent) recomputeReadyLocked() {
 	all := len(a.svcState) > 0
 	for _, ok := range a.svcState {
 		if !ok {
@@ -129,7 +165,22 @@ func (a *agent) recomputeServicesReadyLocked() {
 			break
 		}
 	}
+	for _, s := range a.services {
+		if !a.svcState[s.Name] {
+			all = false
+			break
+		}
+	}
 	a.servicesReady.Store(all)
+
+	presetsOK := true
+	for _, s := range a.services {
+		if isPresetService(s) && !a.svcState[s.Name] {
+			presetsOK = false
+			break
+		}
+	}
+	a.presetsReady.Store(presetsOK)
 }
 
 func (a *agent) serviceSnapshot() map[string]bool {
@@ -163,7 +214,7 @@ func (a *agent) runCustomService(svc types.ServiceSpec) {
 		return
 	}
 	cmd := exec.Command(svc.Cmd[0], svc.Cmd[1:]...)
-	cmd.Dir = workspaceDir
+	cmd.Dir = a.workspace()
 	cmd.Env = a.mergeEnv(svc.Env)
 	cmd.Stdout, cmd.Stderr = logOut, logOut
 	sys := &syscall.SysProcAttr{Setsid: true}
@@ -221,6 +272,16 @@ func (a *agent) waitServiceReady(svc types.ServiceSpec, exited <-chan struct{}, 
 			return nil
 		}
 	}
+	var readyCred *syscall.Credential
+	var readyHome string
+	if svc.User != "" && len(svc.ReadyCmd) > 0 {
+		cred, home, err := lookupUserCred(svc.User)
+		if err != nil {
+			return err
+		}
+		readyCred = cred
+		readyHome = home
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -228,16 +289,26 @@ func (a *agent) waitServiceReady(svc types.ServiceSpec, exited <-chan struct{}, 
 			return errors.New("exited before becoming ready")
 		default:
 		}
+		tcpOK := svc.ReadyTCP == ""
 		if svc.ReadyTCP != "" {
 			if c, err := net.DialTimeout("tcp", svc.ReadyTCP, 500*time.Millisecond); err == nil {
 				c.Close()
+				tcpOK = true
+			}
+		}
+		if tcpOK {
+			if len(svc.ReadyCmd) == 0 {
 				return nil
 			}
-		} else if len(svc.ReadyCmd) > 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			probe := exec.CommandContext(ctx, svc.ReadyCmd[0], svc.ReadyCmd[1:]...)
-			probe.Dir = workspaceDir
-			probe.Env = a.mergeEnv(svc.Env)
+			probe.Dir = a.workspace()
+			if readyCred != nil {
+				probe.Env = a.mergeEnv([]string{"HOME=" + readyHome}, svc.Env)
+				probe.SysProcAttr = &syscall.SysProcAttr{Credential: readyCred}
+			} else {
+				probe.Env = a.mergeEnv(svc.Env)
+			}
 			err := a.procs.run(probe)
 			cancel()
 			if err == nil {
@@ -263,8 +334,19 @@ func (a *agent) checkpointServices(parent context.Context) []error {
 		}
 		ctx, cancel := context.WithTimeout(parent, checkpointWait)
 		cmd := exec.CommandContext(ctx, svc.CheckpointCmd[0], svc.CheckpointCmd[1:]...)
-		cmd.Dir = workspaceDir
-		cmd.Env = a.mergeEnv(svc.Env)
+		cmd.Dir = a.workspace()
+		if svc.User != "" {
+			cred, home, err := lookupUserCred(svc.User)
+			if err != nil {
+				cancel()
+				errs = append(errs, fmt.Errorf("checkpoint %s: %w", svc.Name, err))
+				continue
+			}
+			cmd.Env = a.mergeEnv([]string{"HOME=" + home}, svc.Env)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+		} else {
+			cmd.Env = a.mergeEnv(svc.Env)
+		}
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		err := a.procs.run(cmd)

