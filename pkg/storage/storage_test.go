@@ -376,3 +376,46 @@ func TestSubdirectoryRepoSyncAndApply(t *testing.T) {
 		t.Fatalf("sibling altered unexpectedly: %q (%v)", gotSibling, err)
 	}
 }
+
+func TestApplyPatchBinaryAndNewFileViaStdin(t *testing.T) {
+	src := t.TempDir()
+	git(t, src, "init", "-q")
+	write(t, src, "base.txt", "base\n", 0o644)
+	git(t, src, "add", "-A")
+	git(t, src, "commit", "-q", "-m", "base")
+
+	binPayload := []byte{0x00, 0x01, 0x02, 0x7f, 'E', 'L', 'F', 0xff, 0xfe, '\n', 0x00}
+	if err := os.MkdirAll(filepath.Join(src, "assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "assets", "blob.bin"), binPayload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	write(t, src, "scripts/run.sh", "#!/bin/sh\necho ok\n", 0o755)
+	git(t, src, "add", "-A")
+	patch := []byte(git(t, src, "diff", "--cached", "--binary", "HEAD"))
+
+	dst := t.TempDir()
+	git(t, dst, "init", "-q")
+	write(t, dst, "base.txt", "base\n", 0o644)
+	git(t, dst, "add", "-A")
+	git(t, dst, "commit", "-q", "-m", "base")
+
+	if err := ApplyPatch(dst, patch); err != nil {
+		t.Fatalf("ApplyPatch binary/new-file: %v", err)
+	}
+	gotBin, err := os.ReadFile(filepath.Join(dst, "assets", "blob.bin"))
+	if err != nil {
+		t.Fatalf("read blob.bin: %v", err)
+	}
+	if !bytes.Equal(gotBin, binPayload) {
+		t.Fatalf("blob.bin = %x, want %x", gotBin, binPayload)
+	}
+	fi, err := os.Stat(filepath.Join(dst, "scripts", "run.sh"))
+	if err != nil {
+		t.Fatalf("stat scripts/run.sh: %v", err)
+	}
+	if fi.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("scripts/run.sh mode = %o, expected executable", fi.Mode().Perm())
+	}
+}

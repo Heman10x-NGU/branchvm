@@ -3,7 +3,6 @@
 package rootfs
 
 import (
-	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -303,7 +302,11 @@ func CacheKey(imageID, execdSHA string, services []types.ServiceSpec, rootfsSize
 // ComputeExt4Sizing computes ext4 image MiB size and inode count from
 // unpacked staging byte and entry totals.
 func ComputeExt4Sizing(bytesTotal, entries, requestedSizeMB int64) (sizeMB, inodes int64) {
-	needBytes := (bytesTotal*135)/100 + (headroomMB << 20)
+	inodes = entries*2 + inodeMargin
+	if inodes < minInodes {
+		inodes = minInodes
+	}
+	needBytes := (bytesTotal*135)/100 + inodes*256 + (64 << 20) + (headroomMB << 20)
 	needMB := (needBytes + (1 << 20) - 1) >> 20
 	if needMB < minRootfsMB {
 		needMB = minRootfsMB
@@ -311,10 +314,6 @@ func ComputeExt4Sizing(bytesTotal, entries, requestedSizeMB int64) (sizeMB, inod
 	sizeMB = ((needMB + roundStepMB - 1) / roundStepMB) * roundStepMB
 	if requestedSizeMB > sizeMB {
 		sizeMB = requestedSizeMB
-	}
-	inodes = entries*2 + inodeMargin
-	if inodes < minInodes {
-		inodes = minInodes
 	}
 	return sizeMB, inodes
 }
@@ -413,7 +412,7 @@ func exportImageToDir(ctx context.Context, image, staging string, out io.Writer)
 		return fmt.Errorf("start docker export: %w", err)
 	}
 
-	untarErr := untarPreservingRoot(pipe, staging)
+	untarErr := untarPreservingRoot(ctx, pipe, staging)
 	expWaitErr := exp.Wait()
 	if untarErr != nil {
 		return fmt.Errorf("%s: %w", tarExitTimeoutErr, untarErr)
@@ -424,59 +423,21 @@ func exportImageToDir(ctx context.Context, image, staging string, out io.Writer)
 	return nil
 }
 
-// untarPreservingRoot invokes GNU tar when running as root to preserve
-// numeric uid/gid, device nodes, and xattrs, falling back to Go archive/tar
-// only if tar CLI is missing.
-func untarPreservingRoot(r io.Reader, staging string) error {
-	if _, err := exec.LookPath("tar"); err == nil {
-		cmd := exec.Command("tar", "-xpf", "-", "--numeric-owner", "--same-permissions", "-C", staging)
-		cmd.Stdin = r
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
-		}
-		return nil
+// untarPreservingRoot invokes GNU tar to preserve numeric uid/gid, device
+// nodes, hardlinks, and permissions while avoiding Go archive/tar symlink bugs.
+func untarPreservingRoot(ctx context.Context, r io.Reader, staging string) error {
+	tarBin, err := exec.LookPath("tar")
+	if err != nil {
+		return fmt.Errorf("tar binary not found in PATH (required to extract rootfs safely): %w", err)
 	}
-	tr := tar.NewReader(r)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		rel := strings.TrimPrefix(filepath.Clean("/"+hdr.Name), "/")
-		if rel == "" {
-			continue
-		}
-		dst := filepath.Join(staging, rel)
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(dst, hdr.FileInfo().Mode().Perm()); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-			_ = os.Remove(dst)
-			if err := os.Symlink(hdr.Linkname, dst); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-			_ = os.Remove(dst)
-			f, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode().Perm())
-			if err != nil {
-				return err
-			}
-			_, werr := io.Copy(f, tr)
-			cerr := f.Close()
-			if err := errors.Join(werr, cerr); err != nil {
-				return err
-			}
-		}
+	cmd := exec.CommandContext(ctx, tarBin, "-xpf", "-", "--numeric-owner", "--same-permissions", "-C", staging)
+	cmd.Stdin = r
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
 	}
+	return nil
 }
 
 func validateGuestBins(staging string, imageEnv []string) error {
@@ -586,6 +547,72 @@ func stageGuestOverlay(staging, execdPath string, services []types.ServiceSpec, 
 		if err := safeWriteFile(staging, "/root/.claude.json", []byte("{\"hasCompletedOnboarding\":true}\n"), 0o600); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// InjectBaseOverlay loop-mounts an existing ext4 rootfs image and installs
+// the validated static execd binary at /sbin/init along with services.json.
+func InjectBaseOverlay(ctx context.Context, rootfsPath, execdPath string, services []types.ServiceSpec) (retErr error) {
+	if err := ValidateExecdELF(execdPath, runtime.GOARCH); err != nil {
+		return fmt.Errorf("invalid execd %s: %w", execdPath, err)
+	}
+	execdData, err := os.ReadFile(execdPath)
+	if err != nil {
+		return fmt.Errorf("read execd %s: %w", execdPath, err)
+	}
+	if services == nil {
+		services = []types.ServiceSpec{}
+	}
+	svcBytes, err := json.MarshalIndent(services, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal services.json: %w", err)
+	}
+
+	mnt, err := os.MkdirTemp("", "branchvm-overlay-*")
+	if err != nil {
+		return fmt.Errorf("create overlay mountpoint: %w", err)
+	}
+	mounted := false
+	defer func() {
+		if !mounted {
+			_ = os.Remove(mnt)
+			return
+		}
+		var umountErr bytes.Buffer
+		umountCmd := exec.Command("umount", mnt)
+		umountCmd.Stderr = &umountErr
+		if err := umountCmd.Run(); err != nil {
+			var lazyErr bytes.Buffer
+			lazyCmd := exec.Command("umount", "-l", mnt)
+			lazyCmd.Stderr = &lazyErr
+			if lerr := lazyCmd.Run(); lerr != nil {
+				if retErr == nil {
+					retErr = fmt.Errorf("umount %s: %v (%s); umount -l: %w (%s)",
+						mnt, err, strings.TrimSpace(umountErr.String()), lerr, strings.TrimSpace(lazyErr.String()))
+				}
+				return
+			}
+		}
+		_ = os.Remove(mnt)
+	}()
+
+	var mountErr bytes.Buffer
+	mountCmd := exec.CommandContext(ctx, "mount", "-o", "loop", rootfsPath, mnt)
+	mountCmd.Stderr = &mountErr
+	if err := mountCmd.Run(); err != nil {
+		return fmt.Errorf("loop-mount %s: %w: %s", rootfsPath, err, strings.TrimSpace(mountErr.String()))
+	}
+	mounted = true
+
+	if err := safeMkdir(mnt, "/etc/branchvm", 0o755); err != nil {
+		return err
+	}
+	if err := safeWriteFile(mnt, "/sbin/init", execdData, 0o755); err != nil {
+		return err
+	}
+	if err := safeWriteFile(mnt, "/etc/branchvm/services.json", append(svcBytes, '\n'), 0o644); err != nil {
+		return err
 	}
 	return nil
 }
@@ -757,7 +784,9 @@ func measureDir(root string) (bytesTotal, entries int64, err error) {
 				}
 				seenInodes[ino] = struct{}{}
 			}
-			bytesTotal += info.Size()
+			bytesTotal += ((info.Size() + 4095) / 4096) * 4096
+		} else if info.IsDir() {
+			bytesTotal += 4096
 		}
 		return nil
 	})
