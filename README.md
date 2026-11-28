@@ -136,20 +136,34 @@ To let coding agents stream LLM responses while the internet is blocked, the fir
 
 ### Install on Linux (`amd64` or `arm64` with `/dev/kvm`)
 
+Build from source. On Ubuntu or Debian, install the packages `branchvm` needs:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Heman10x-NGU/branchvm/main/scripts/install.sh | sudo sh
-sudo bash /usr/local/share/branchvm/fetch-assets.sh
+sudo apt-get update
+sudo apt-get install -y xfsprogs nftables iproute2 curl jq git golang-go debootstrap docker.io
 ```
 
-Or build from source (on Apple silicon M3+ Mac, create the Lima `fc-lab` VM first):
+Clone the repo, fetch Firecracker and the guest kernel into `/var/lib/branchvm/assets` (the script runs as root), build both binaries, and install the guest `execd` binary into the assets directory:
 
 ```bash
+git clone https://github.com/Heman10x-NGU/branchvm.git
+cd branchvm
+sudo bash scripts/fetch-assets.sh
+make build-all
+sudo install -m 0755 bin/execd /var/lib/branchvm/assets/execd
+```
+
+On an Apple silicon M3+ Mac, clone the repo on the Mac, create the Lima `fc-lab` VM (it installs the same packages), and fetch the assets inside it:
+
+```bash
+git clone https://github.com/Heman10x-NGU/branchvm.git
+cd branchvm
 scripts/setup-lima.sh
 limactl shell fc-lab sudo bash scripts/fetch-assets.sh
 limactl shell fc-lab
 ```
 
-Inside the Linux host or `fc-lab`:
+Inside `fc-lab`:
 
 ```bash
 make build-all
@@ -246,3 +260,7 @@ Full methodology and all three tables are in [BENCHMARKS.md](BENCHMARKS.md). Eve
 - The `nftables` firewall drops all outbound traffic except the host LLM gateway (`10.200.i.1:18080` for Anthropic, OpenAI, OpenRouter, and `[providers.*]`). It is active during both `--warm` and branch runs, so install project dependencies in your Dockerfile or vendor them before `branchvm init`, since `npm install` or `pip install` inside a VM cannot reach public registries.
 - Branch IPs are assigned per index, so one run owns the host at a time; `run` refuses to start while another run has live VMs.
 - This is a local developer tool, not multi-tenant production hardening. It runs as root, starts Firecracker without `jailer`, and does not isolate untrusted tenants from each other.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
